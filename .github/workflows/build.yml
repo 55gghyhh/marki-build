@@ -25,6 +25,7 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           export PATH=$THEOS/bin:$PATH
+          printf '{ Filter = { Bundles = ( "com.ai.marki" ); }; }\n' > MarkiFake.plist
           make clean
           make package FINALPACKAGE=1
 
