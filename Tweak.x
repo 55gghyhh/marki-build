@@ -621,12 +621,12 @@ static int MKRebindAllImages(MKHookEntry *tab, int tabCount, const char *tag) {
         if (!h) continue;
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
         int got = MKRebindOneImage((const struct mach_header_64 *)h, slide, tab, tabCount);
-        if (got) MKLog(@"%@：%s → 改写 %d 个槽位", tag ?: @"rebind", path, got);
+        if (got) MKLog(@"%s：%s → 改写 %d 个槽位", tag ? tag : "rebind", path, got);
         scanned++;
         total += got;
     }
-    MKLog(@"%@ fishhook: 共 %u 个镜像，白名单命中 %d 个，改写 %d 个槽位",
-          tag ?: @"rebind", n, scanned, total);
+    MKLog(@"%s fishhook: 共 %u 个镜像，白名单命中 %d 个，改写 %d 个槽位",
+          tag ? tag : "rebind", n, scanned, total);
     return total;
 }
 
@@ -646,7 +646,7 @@ static BOOL MKApplyClockHook(void) {
         { "_gettimeofday",  (void *)MK_gettimeofday,  (void **)&gOrigGettimeofday,  MK_GROUP_CLOCK },
         { "_clock_gettime", (void *)MK_clock_gettime, (void **)&gOrigClockGettime,  MK_GROUP_CLOCK },
     };
-    int total = MKRebindAllImages(tab, 3, @"时钟");
+    int total = MKRebindAllImages(tab, 3, "时钟");
     gClockHooked = (total > 0);
     return gClockHooked;
 }
@@ -963,8 +963,7 @@ static void mk_reverseGeo(id self, SEL _cmd, CLLocation *loc, id handler) {
             MKPlacemark *mp = [[MKPlacemark alloc] initWithCoordinate:c addressDictionary:addrDict];
             CLPlacemark *cp = [[CLPlacemark alloc] initWithPlacemark:mp];
             MKLog(@"CLGeocoder 拦截 (%.6f,%.6f) → %@", c.latitude, c.longitude, CFG().addr);
-            typedef void (^MKGeoHandler)(NSArray *, NSError *);
-            MKGeoHandler h = (__bridge MKGeoHandler)handler;
+                        void (^h)(NSArray *, NSError *) = (void (^)(NSArray *, NSError *))handler;
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (h) h(cp ? @[cp] : @[], nil);
             });
@@ -1075,7 +1074,7 @@ static void MKInstallVerifyHooks(void) {
                   (void *)mk_CGImageSourceCopyPropertiesAtIndex,
                   (void **)&gOrigCGISProps, MK_GROUP_EXIF },
             };
-            MKRebindAllImages(tab, 1, @"EXIF");
+            MKRebindAllImages(tab, 1, "EXIF");
         } else {
             MKLog(@"✗ 拿不到 CGImageSourceCopyPropertiesAtIndex 真身，EXIF 注入不可用");
         }
