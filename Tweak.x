@@ -396,14 +396,58 @@ static CLLocation *MKFakeLocation(void) {
     gFakeLoc = loc; gFakeLat = c.lat; gFakeLng = c.lng;
     return gFakeLoc;
 }
+// 判断某个 KVC key 能不能安全塞 NSString：
+//   · 有属性元数据 → 只接受 NSString / NSMutableString（防止把 @"..." 写进对象槽，
+//     比如 reGeocode，之后 App 拿它当模型调 name 立刻崩）
+//   · 没元数据（Swift @objc / 动态属性）→ 只在当前值为 nil 或本身就是字符串时动手
+static BOOL MKSafeStringKey(Class cls, id model, NSString *key) {
+    objc_property_t prop = class_getProperty(cls, key.UTF8String);
+    if (prop) {
+        const char *attrs = property_getAttributes(prop);
+        if (!attrs) return NO;
+        return (strstr(attrs, "@\"NSString\"") != NULL ||
+                strstr(attrs, "@\"NSMutableString\"") != NULL);
+    }
+    @try {
+        id cur = [model valueForKey:key];
+        if (cur == nil) return YES;
+        return [cur isKindOfClass:[NSString class]];
+    } @catch (NSException *e) { return NO; }
+}
+
 static void MKSpoofModel(id model) {
     if (!model || !CFG().locOn) return;
-    @try { [model setValue:@(CFG().lat) forKey:@"latitude"]; [model setValue:@(CFG().lng) forKey:@"longitude"]; } @catch (NSException *e) { return; }
-    if (CFG().addr.length) {
+    Class cls = object_getClass(model);
+
+    // 经纬度：写不进去就说明这不是定位模型，直接收手
+    @try {
+        [model setValue:@(CFG().lat) forKey:@"latitude"];
+        [model setValue:@(CFG().lng) forKey:@"longitude"];
+    } @catch (NSException *e) { return; }
+
+    if (!CFG().addr.length) return;
+
+    // 穷举地址字段。故意不含 reGeocode / locationReGeocodeInfo —— 那两个是对象，
+    // 塞字符串会崩；它们的 getter 已经在上面的「验真对齐」段里被强制改写。
+    NSArray *addrKeys = @[@"address", @"nowAllAddress", @"name", @"poiName",
+                          @"formattedAddress", @"detailAddress", @"addressName",
+                          @"fullAddress", @"locationName", @"locationAddress",
+                          @"addressDetail", @"positionAddress"];
+
+    NSMutableArray *applied = [NSMutableArray array];
+    for (NSString *key in addrKeys) {
+        if (!MKSafeStringKey(cls, model, key)) continue;
+        SEL setter = NSSelectorFromString([NSString stringWithFormat:@"set%@%@:",
+                        [[key substringToIndex:1] uppercaseString], [key substringFromIndex:1]]);
+        if (![model respondsToSelector:setter]) continue;
         @try {
-            if ([model respondsToSelector:MKSEL(setAddress:)]) [model setValue:CFG().addr forKey:@"address"];
-            else if ([model respondsToSelector:MKSEL(setNowAllAddress:)]) [model setValue:CFG().addr forKey:@"nowAllAddress"];
+            [model setValue:CFG().addr forKey:key];
+            [applied addObject:key];
         } @catch (NSException *e) {}
+    }
+
+    if (applied.count) {
+        MKLOG_ONCE(@"地址注入 %@ → %@", NSStringFromClass(cls), [applied componentsJoinedByString:@","]);
     }
 }
 static IMP o_mgrGetRecent = NULL, o_mgrSetRecent = NULL, o_mgrCheckAuth = NULL, o_infoLat = NULL, o_infoLng = NULL, o_objLat = NULL, o_objLng = NULL, o_locMgrLocation = NULL, o_locCoord = NULL, o_locSource = NULL;
@@ -1334,18 +1378,38 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
 }
 @end
 
-@interface MKLogViewController : UIViewController @end
+@interface MKLogViewController : UIViewController
+- (void)shareTap;
+@end
 @implementation MKLogViewController
 - (void)viewDidLoad {
     [super viewDidLoad]; self.view.backgroundColor = MKC_RGB(20, 20, 26);
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 96)]; bar.backgroundColor = MKC_RGBA(38, 38, 46, 0.98); [self.view addSubview:bar];
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(0, 54, bar.bounds.size.width, 26)]; t.text = @"运行日志"; t.textAlignment = NSTextAlignmentCenter; t.font = [UIFont boldSystemFontOfSize:16]; t.textColor = MKC_TEXT(); [bar addSubview:t];
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem]; close.frame = CGRectMake(10, 52, 60, 30); [close setTitle:@"关闭" forState:UIControlStateNormal]; [close addTarget:self action:@selector(closeTap) forControlEvents:UIControlEventTouchUpInside]; [bar addSubview:close];
+    UIButton *share = [UIButton buttonWithType:UIButtonTypeSystem];
+    share.frame = CGRectMake(bar.bounds.size.width - 140, 52, 60, 30);
+    [share setTitle:@"分享" forState:UIControlStateNormal];
+    [share setTitleColor:MKC_BLUE() forState:UIControlStateNormal];
+    [share addTarget:self action:@selector(shareTap) forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:share];
+
     UIButton *clear = [UIButton buttonWithType:UIButtonTypeSystem]; clear.frame = CGRectMake(bar.bounds.size.width - 70, 52, 60, 30); [clear setTitle:@"清空" forState:UIControlStateNormal]; [clear setTitleColor:MKC_RED() forState:UIControlStateNormal]; [clear addTarget:self action:@selector(clearTap) forControlEvents:UIControlEventTouchUpInside]; [bar addSubview:clear];
     UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 96, self.view.bounds.size.width, self.view.bounds.size.height - 96)]; tv.tag = 8002; tv.backgroundColor = MKC_RGB(20, 20, 26); tv.textColor = MKC_RGBA(140, 250, 180, 0.92); tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular]; tv.editable = NO; tv.text = MKLogWhole(); tv.textContainerInset = UIEdgeInsetsMake(10, 10, 24, 10); [self.view addSubview:tv];
     dispatch_async(dispatch_get_main_queue(), ^{ [tv scrollRangeToVisible:NSMakeRange(tv.text.length ? tv.text.length - 1 : 0, 1)]; });
 }
 - (void)closeTap { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)shareTap {
+    NSString *log = MKLogWhole();
+    UIActivityViewController *ac = [[UIActivityViewController alloc] initWithActivityItems:@[log] applicationActivities:nil];
+    // iPad 必须给 popover 锚点，否则 present 直接崩
+    if (ac.popoverPresentationController) {
+        ac.popoverPresentationController.sourceView = self.view;
+        ac.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, 60, 1, 1);
+    }
+    MKLog(@"导出日志 %lu 字节", (unsigned long)log.length);
+    [self presentViewController:ac animated:YES completion:nil];
+}
 - (void)clearTap { [[NSFileManager defaultManager] removeItemAtPath:MKLogFilePath() error:NULL]; ((UITextView *)[self.view viewWithTag:8002]).text = @"（日志已清空）"; }
 @end
 
@@ -1605,16 +1669,40 @@ static NSURLRequest *MKNeutralize(NSURLRequest *req) {
 
 static IMP o_dtReqCb = NULL, o_dtReq = NULL, o_dtUrlCb = NULL, o_dtUrl = NULL, o_syncReq = NULL;
 
+// 诊断用：把地图 / 反查 / 验真相关的请求全打到日志里
+static BOOL MKIsInterestingURL(NSString *urlStr) {
+    if (!urlStr.length) return NO;
+    static NSArray *keys = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = @[@"map", @"location", @"verify", @"confirm", @"tencent", @"baidu",
+                 @"regeo", @"geocode", @"address", @"watermark", @"hash", @"exif"];
+    });
+    NSString *low = urlStr.lowercaseString;
+    for (NSString *k in keys) if ([low containsString:k]) return YES;
+    return NO;
+}
+
+static void MKLogNetReq(NSString *urlStr) {
+    if (!MKIsInterestingURL(urlStr)) return;
+    NSString *s = urlStr.length > 300 ? [urlStr substringToIndex:300] : urlStr;
+    MKLog(@"[NetReq] %@", s);
+}
+
 static id h_dtReqCb(id self, SEL _cmd, NSURLRequest *req, id cb) {
+    MKLogNetReq(req.URL.absoluteString);
     return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, MKNeutralize(req), cb);
 }
 static id h_dtReq(id self, SEL _cmd, NSURLRequest *req) {
+    MKLogNetReq(req.URL.absoluteString);
     return ((id (*)(id, SEL, id))o_dtReq)(self, _cmd, MKNeutralize(req));
 }
 static id h_dtUrlCb(id self, SEL _cmd, NSURL *url, id cb) {
+    MKLogNetReq(url.absoluteString);
     return ((id (*)(id, SEL, id, id))o_dtUrlCb)(self, _cmd, MKIsAdURL(url) ? MKBlockedURL() : url, cb);
 }
 static id h_dtUrl(id self, SEL _cmd, NSURL *url) {
+    MKLogNetReq(url.absoluteString);
     return ((id (*)(id, SEL, id))o_dtUrl)(self, _cmd, MKIsAdURL(url) ? MKBlockedURL() : url);
 }
 
@@ -1631,31 +1719,38 @@ static NSData *h_syncReq(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **r
     return ((NSData *(*)(id, SEL, id, NSURLResponse **, NSError **))o_syncReq)(self, _cmd, req, resp, err);
 }
 
+// 拆成两段：请求监控「无条件装」（诊断用），广告拦截「按开关装」。
+// 原来整段被 adBlockOn 挡住，而 adBlockOn 默认 NO →
+// [NetReq] 日志永远不会出现，等于白装。
 static void MKInstallAdBlock(void) {
-    static BOOL done = NO; if (done) return;
-    if (!CFG().adBlockOn) return;
+    static BOOL netDone   = NO;
+    static BOOL blockDone = NO;
 
-    // ① 原来的 NSURLProtocol（保留）
+    // ① 请求监控：只装一次，与广告开关无关
+    if (!netDone) {
+        netDone = YES;
+        Class sess = objc_getClass("NSURLSession");
+        o_dtReqCb = MKHook(sess, @selector(dataTaskWithRequest:completionHandler:), (IMP)h_dtReqCb, "Net_DataTaskReqCb");
+        o_dtReq   = MKHook(sess, @selector(dataTaskWithRequest:),                    (IMP)h_dtReq,   "Net_DataTaskReq");
+        o_dtUrlCb = MKHook(sess, @selector(dataTaskWithURL:completionHandler:),      (IMP)h_dtUrlCb, "Net_DataTaskUrlCb");
+        o_dtUrl   = MKHook(sess, @selector(dataTaskWithURL:),                        (IMP)h_dtUrl,   "Net_DataTaskUrl");
+        o_syncReq = MKHookClass(objc_getClass("NSURLConnection"),
+                                @selector(sendSynchronousRequest:returningResponse:error:),
+                                (IMP)h_syncReq, "+[NSURLConnection sendSynchronousRequest:...]");
+        MKLog(@"请求监控已装：4 个 dataTask 入口 + 同步请求（命中 map/location/verify/confirm 才打日志）");
+    }
+
+    // ② 广告拦截：只在开关打开时启用
+    if (blockDone) return;
+    if (!CFG().adBlockOn) { MKLog(@"广告拦截未启用（adBlockOn=NO），仅保留请求监控"); return; }
+
     [NSURLProtocol registerClass:[MKAdBlockProtocol class]];
     gAdBlockActive = YES;
-    done = YES;
+    blockDone = YES;
 
-    // ② 强制把拦截器插到 protocolClasses 第 0 位（压过 SDK 自己设的）
     o_setProtocolClasses = MKHook(objc_getClass("NSURLSessionConfiguration"), MKSEL(setProtocolClasses:), (IMP)h_setProtocolClasses, "AdBlock_SetProtocols");
 
-    // ③ NSURLSession dataTask 入口
-    Class sess = objc_getClass("NSURLSession");
-    o_dtReqCb = MKHook(sess, @selector(dataTaskWithRequest:completionHandler:), (IMP)h_dtReqCb, "AdBlock_DataTaskReqCb");
-    o_dtReq   = MKHook(sess, @selector(dataTaskWithRequest:),                    (IMP)h_dtReq,   "AdBlock_DataTaskReq");
-    o_dtUrlCb = MKHook(sess, @selector(dataTaskWithURL:completionHandler:),      (IMP)h_dtUrlCb, "AdBlock_DataTaskUrlCb");
-    o_dtUrl   = MKHook(sess, @selector(dataTaskWithURL:),                        (IMP)h_dtUrl,   "AdBlock_DataTaskUrl");
-
-    // ④ NSURLConnection 同步接口
-    o_syncReq = MKHookClass(objc_getClass("NSURLConnection"),
-                            @selector(sendSynchronousRequest:returningResponse:error:),
-                            (IMP)h_syncReq, "+[NSURLConnection sendSynchronousRequest:...]");
-
-    MKLog(@"去广告已装：Protocol + 4 个 dataTask 入口 + 同步请求，关键字 %lu 条",
+    MKLog(@"广告拦截已启用，关键字 %lu 条",
           (unsigned long)[MKAdBlockProtocol mk_adKeywords].count);
 }
 
@@ -1670,7 +1765,8 @@ static void MKInstallAllHooks(void) {
 static void MKInstallDeferredHooks(void) {
     static BOOL done = NO; if (done) return; done = YES;
     MKSafeInstall(MKInstallTimeHooks, "时间(ObjC)");
-    if (CFG().adBlockOn) { MKSafeInstall(MKInstallAdBlock, "去广告"); }
+    // 请求监控必须无条件装（广告拦截在函数内部自己判断开关）
+    MKSafeInstall(MKInstallAdBlock, "网络监控+去广告");
     if (CFG().safeClockOn) { @try { MKSetSafeClock(YES); } @catch (NSException *e) {} }
 }
 
