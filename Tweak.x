@@ -1566,10 +1566,68 @@ static id mk_tnkLoc(id self, SEL _cmd) {
 }
 
 // ---- 高德：-[AMapLocationReGeocode ...] 已由验真段的模型 hook 覆盖，这里只补 CLLocation ----
+// ============================================================================
+//  坐标转换探针（任务 2）
+//
+//  二进制里**没有**可 hook 的 ObjC 坐标转换类：
+//    _TtC8marki_cn19TransformCoordinate   → 0 个 ObjC 方法（纯 Swift enum/struct）
+//    CoordinateTool                       → 0 个 ObjC 方法
+//    BMFCoordTransType                    → 只有 -handleMethodCall:result:（Flutter 通道）
+//  也就是说 App 的坐标换算是内联在 Swift 里的，没有 selector 可挂。
+//
+//  实测反推（用你的日志数字）：App 把 WGS(30.585041,104.062257) 算成
+//  BD09(30.5911601,104.0687073)，只差 21.6 m —— 即它内部固定做 WGS→BD09，
+//  然后贴上 mapType=TENCENT 发出去。所以"700 米偏差"的真正来源是
+//  「BD09 值被当成 GCJ 用」，而反查结果又覆盖了我们的地址。
+//
+//  因此这里只做观测，不做替换：替换通道返回值会破坏 Flutter 的 ABI。
+//  真正修地址靠 MKNetHookProtocol 改响应（已生效）。
+// ============================================================================
+
+static IMP o_bmfCoord = NULL;
+
+static void h_bmfCoord(id self, SEL _cmd, id call, id result) {
+    @try {
+        NSString *method = nil;
+        @try { method = [call valueForKey:@"method"]; } @catch (NSException *e) {}
+        if (method.length) {
+            id args = nil;
+            @try { args = [call valueForKey:@"arguments"]; } @catch (NSException *e) {}
+            MKLog(@"[CoordCh] %@ args=%@", method, args);
+        }
+    } @catch (NSException *e) {}
+    if (o_bmfCoord) ((void (*)(id, SEL, id, id))o_bmfCoord)(self, _cmd, call, result);
+}
+
+static void MKProbeCoordConverters(void) {
+    const char *names[] = {
+        "_TtC8marki_cn19TransformCoordinate", "CoordinateTool", "BMFCoordTransType",
+        "BMFCoordinate", "AMapLocationCoordinateConverter", "BMKCoordConverter",
+        "BMKCoordinateConverter", "TNKCoordinateConvert", NULL
+    };
+    for (int i = 0; names[i]; i++) {
+        Class c = objc_getClass(names[i]);
+        if (!c) { MKLog(@"[CoordProbe] %s : absent", names[i]); continue; }
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(c, &n);
+        MKLog(@"[CoordProbe] %s : %u objc methods", names[i], n);
+        for (unsigned int k = 0; k < n && k < 12; k++) {
+            MKLog(@"     -%s %s", sel_getName(method_getName(ms[k])), method_getTypeEncoding(ms[k]));
+        }
+        free(ms);
+    }
+
+    // Flutter 通道：如果坐标换算走这里，日志会打出 coordConvert 之类的 method 名
+    o_bmfCoord = MKHook(objc_getClass("BMFCoordTransType"),
+                        MKSEL(handleMethodCall:result:), (IMP)h_bmfCoord, "Coord_BMFChannel");
+}
+
 static void MKInstallDatumHooks(void) {
     static BOOL done = NO;
     if (done) return;
     done = YES;
+
+    MKProbeCoordConverters();
 
     o_bmkLoc = MKHook(objc_getClass("BMKLocation"), NSSelectorFromString(@"location"),
                       (IMP)mk_bmkLoc, "Datum_BMKLocation");
@@ -1988,31 +2046,192 @@ static void MKShowPanel(void) {
     });
 }
 
-@interface MKAdBlockProtocol : NSURLProtocol @end
-@implementation MKAdBlockProtocol
+// 前向声明：协议里用到，定义在本段之后
+static BOOL MKIsGeoURL(NSURL *url);
+static NSData *MKRewriteGeoData(NSData *data, NSURL *url);
+
+// ============================================================================
+//  统一网络劫持协议
+//    · 广告      → 立即 -999 失败（保持原去广告行为）
+//    · 地理接口  → 转发后改写响应 JSON（地址/坐标）
+//    · getNewWatermark → 落盘请求体 + 响应体（防伪码取证）
+//
+//  为什么必须走 NSURLProtocol 而不是 completionHandler：
+//    marki 用 AFNetworking 的 delegate 模式（dataTaskWithRequest: 无 handler +
+//    NSURLSessionDataDelegate），completionHandler 那条路根本不会被调用 ——
+//    上一版 [Geo] handler wrapped 一次都没打印就是这个原因。
+// ============================================================================
+
+@interface MKNetHookProtocol : NSURLProtocol
++ (NSArray<NSString *> *)mk_adKeywords;
+@end
+
+@implementation MKNetHookProtocol
+
 + (NSArray<NSString *> *)mk_adKeywords {
     static NSArray *a = nil; static dispatch_once_t once;
     dispatch_once(&once, ^{ a = @[@"pangolin", @"snssdk", @"bytedance", @"pangle", @"byteimg.com/ad", @"gdt.qq.com", @"e.qq.com", @"adsmind", @"adnet.qq", @"kuaishou", @"gifshow", @"kwai", @"cpro", @"mobads", @"baidu.com/ad", @"union.baidu", @"jd.com/ad", @"tanx.com", @"alimama", @"umeng.com/ad", @"/api/ad", @"/ad/get", @"/adx", @"/splash/ad", @"/api/v1/ad"]; });
     return a;
 }
+
++ (BOOL)isWatermarkURL:(NSURL *)url {
+    if (!url) return NO;
+    return ([url.absoluteString containsString:@"WaterMark/getNewWatermark"] ||
+            [url.absoluteString containsString:@"watermark/getNewWatermark"]);
+}
+
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     if (!request.URL) return NO;
-    if ([NSURLProtocol propertyForKey:@"MKAdBlocked" inRequest:request]) return NO;
-    if (!gAdBlockActive) return NO;
-    NSString *s = request.URL.absoluteString.lowercaseString; if (!s.length) return NO;
-    for (NSString *k in [self mk_adKeywords]) { if ([s containsString:k]) return YES; }
+    // 自循环保护：我们转发出去的请求带这个标记，直接放过
+    if ([NSURLProtocol propertyForKey:@"MKHandled" inRequest:request]) return NO;
+
+    if ([self isWatermarkURL:request.URL]) return YES;      // 取证，永远拦
+    if (MKIsGeoURL(request.URL))          return YES;      // 地理接口改写
+    if (gAdBlockActive && [NSURLProtocol propertyForKey:@"MKAdBlocked" inRequest:request] == nil) {
+        NSString *s = request.URL.absoluteString.lowercaseString;
+        for (NSString *k in [self mk_adKeywords]) if ([s containsString:k]) return YES;
+    }
     return NO;
 }
+
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 + (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b { return NO; }
-- (void)startLoading { NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:@{ NSLocalizedDescriptionKey : @"blocked by MarkiFake" }]; [self.client URLProtocol:self didFailWithError:err]; }
+
+// 共享的转发 session（不挂任何自定义 protocol，天然不循环）
+static NSURLSession *MKForwardSession(void) {
+    static NSURLSession *sess = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSURLSessionConfiguration *c = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        c.timeoutIntervalForRequest = 20;
+        c.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+        // 必须共享 cookie，否则转发出去的请求丢登录态 → 401，比不改还糟
+        c.HTTPShouldSetCookies = YES;
+        c.HTTPCookieStorage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+        c.HTTPShouldUsePipelining = NO;
+        sess = [NSURLSession sessionWithConfiguration:c delegate:nil delegateQueue:nil];
+    });
+    return sess;
+}
+
+// 把 HTTPBodyStream 读成 NSData（并回填到可变请求，保证转发仍能发出）
+static NSData *MKReadBody(NSMutableURLRequest *req) {
+    NSData *b = req.HTTPBody;
+    if (b) return b;
+    NSInputStream *st = req.HTTPBodyStream;
+    if (!st) return nil;
+    @try {
+        [st open];
+        NSMutableData *out = [NSMutableData data];
+        uint8_t buf[4096];
+        NSInteger n = 0;
+        while ((n = [st read:buf maxLength:sizeof(buf)]) > 0) [out appendBytes:buf length:(NSUInteger)n];
+        [st close];
+        if (out.length) {
+            req.HTTPBody = out;                  // 回填，转发还能用
+            [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)out.length]
+                  forHTTPHeaderField:@"Content-Length"];
+        }
+        return out.length ? out : nil;
+    } @catch (NSException *e) {
+        MKLog(@"[WM] read body stream failed: %@", e.reason);
+        return nil;
+    }
+}
+
+static NSString *MKPreview(NSData *d, NSUInteger maxLen) {
+    if (!d.length) return @"(empty)";
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (!s) s = [NSString stringWithFormat:@"(binary %lu B)", (unsigned long)d.length];
+    if (s.length > maxLen) s = [[s substringToIndex:maxLen] stringByAppendingString:@"...(truncated)"];
+    return s;
+}
+
+// 防伪码取证：请求体 + 响应体落盘
+static void MKDumpWatermark(NSURLRequest *req, NSData *reqBody, NSData *respBody, NSHTTPURLResponse *resp) {
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [doc stringByAppendingPathComponent:@"mk_watermark_dump.txt"];
+
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"\n===== %@ =====\n", [NSDate date]];
+    [out appendFormat:@"URL    : %@\n", req.URL.absoluteString];
+    [out appendFormat:@"METHOD : %@\n", req.HTTPMethod];
+    [out appendFormat:@"HEADERS: %@\n", req.allHTTPHeaderFields];
+    [out appendFormat:@"BODY   : %lu B\n%@\n", (unsigned long)reqBody.length, MKPreview(reqBody, 4000)];
+    [out appendFormat:@"STATUS : %ld\n", (long)resp.statusCode];
+    [out appendFormat:@"RESP   : %lu B\n%@\n", (unsigned long)respBody.length, MKPreview(respBody, 4000)];
+
+    NSString *full = out;
+    [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) {
+        @try { [fh seekToEndOfFile]; [fh writeData:[full dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        @catch (NSException *e) { MKLog(@"[WM] dump write failed: %@", e.reason); }
+    }
+    MKLog(@"[WM] dumped to %@ (%lu B body / %lu B resp)", path,
+          (unsigned long)reqBody.length, (unsigned long)respBody.length);
+    MKLog(@"[WMBody] %@", MKPreview(reqBody, 1500));
+    MKLog(@"[WMResp] %@", MKPreview(respBody, 1500));
+}
+
+- (void)startLoading {
+    NSURLRequest *req = self.request;
+
+    // ① 广告：直接失败
+    if (gAdBlockActive && !MKIsGeoURL(req.URL) && ![MKNetHookProtocol isWatermarkURL:req.URL]) {
+        NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled
+                                       userInfo:@{ NSLocalizedDescriptionKey : @"blocked by MarkiFake" }];
+        [self.client URLProtocol:self didFailWithError:err];
+        return;
+    }
+
+    BOOL isGeo = MKIsGeoURL(req.URL);
+    BOOL isWM  = [MKNetHookProtocol isWatermarkURL:req.URL];
+
+    NSMutableURLRequest *fwd = [req mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"MKHandled" inRequest:fwd];   // 防自循环
+
+    NSData *reqBody = isWM ? MKReadBody(fwd) : nil;
+    if (isWM) MKLog(@"[WM] %@ body=%lu B", req.URL.path, (unsigned long)reqBody.length);
+
+    __weak typeof(self) weakSelf = self;
+    NSURLSessionDataTask *t = [MKForwardSession() dataTaskWithRequest:fwd
+                                                    completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        __strong typeof(weakSelf) self_ = weakSelf;
+        if (!self_) return;
+        if (err) { [self_.client URLProtocol:self_ didFailWithError:err]; return; }
+
+        NSData *out = data;
+        if (isGeo) {
+            @try { out = MKRewriteGeoData(data, req.URL); }
+            @catch (NSException *e) { MKLog(@"[Geo] rewrite exception: %@", e.reason); out = data; }
+        }
+        if (isWM) {
+            MKDumpWatermark(req, reqBody, data, (NSHTTPURLResponse *)resp);
+        }
+
+        if (!resp) {
+            NSError *e2 = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse
+                                          userInfo:@{ NSLocalizedDescriptionKey : @"MKNetHook: nil response" }];
+            [self_.client URLProtocol:self_ didFailWithError:e2];
+            return;
+        }
+        [self_.client URLProtocol:self_ didReceiveResponse:resp
+               cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        if (out.length) [self_.client URLProtocol:self_ didLoadData:out];
+        [self_.client URLProtocolDidFinishLoading:self_];
+    }];
+    [t resume];
+}
+
 - (void)stopLoading { }
+
 @end
 
 static IMP o_setProtocolClasses = NULL;
 static void h_setProtocolClasses(id self, SEL _cmd, NSArray *classes) {
-    NSMutableArray *arr = [NSMutableArray arrayWithObject:[MKAdBlockProtocol class]];
-    for (id c in classes) if (c != [MKAdBlockProtocol class]) [arr addObject:c];
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:[MKNetHookProtocol class]];
+    for (id c in classes) if (c != [MKNetHookProtocol class]) [arr addObject:c];
     ((void (*)(id, SEL, id))o_setProtocolClasses)(self, _cmd, arr);
 }
 
@@ -2037,7 +2256,7 @@ static BOOL MKIsAdURL(NSURL *url) {
     NSString *s = url.absoluteString.lowercaseString;
     if (!s.length) return NO;
     if ([s containsString:@"__mk_adblocked__"]) return NO;   // 自己造的地址，别再拦
-    for (NSString *k in [MKAdBlockProtocol mk_adKeywords]) {
+    for (NSString *k in [MKNetHookProtocol mk_adKeywords]) {
         if ([s containsString:k]) return YES;
     }
     return NO;
@@ -2270,8 +2489,12 @@ static id MKWrapDataHandler(id handler, NSURL *url) {
 }
 
 static id h_dtReqCb(id self, SEL _cmd, NSURLRequest *req, id cb) {
+    // 我们自己转发出去的请求：打日志可以，绝不能再次改写（否则会二次替换）
+    if ([NSURLProtocol propertyForKey:@"MKHandled" inRequest:req]) {
+        return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, req, cb);
+    }
     MKLogNetReq(req.URL.absoluteString);
-    id wrapped = MKWrapDataHandler(cb, req.URL);
+    id wrapped = MKWrapDataHandler(cb, req.URL);(cb, req.URL);
     return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, MKNeutralize(req), wrapped);
 }
 static id h_dtReq(id self, SEL _cmd, NSURLRequest *req) {
@@ -2301,39 +2524,36 @@ static NSData *h_syncReq(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **r
     return ((NSData *(*)(id, SEL, id, NSURLResponse **, NSError **))o_syncReq)(self, _cmd, req, resp, err);
 }
 
-// 拆成两段：请求监控「无条件装」（诊断用），广告拦截「按开关装」。
-// 原来整段被 adBlockOn 挡住，而 adBlockOn 默认 NO →
-// [NetReq] 日志永远不会出现，等于白装。
+// 网络层统一安装：
+//   ① MKNetHookProtocol 无条件注册 —— 地理改写 / 防伪码取证都靠它，
+//      绝不能跟着 adBlockOn 一起被关掉（上一版就是这么把 [Geo] 全关死的）。
+//   ② gAdBlockActive 只控制 canInit 里的广告分支。
 static void MKInstallAdBlock(void) {
-    static BOOL netDone   = NO;
-    static BOOL blockDone = NO;
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
 
-    // ① 请求监控：只装一次，与广告开关无关
-    if (!netDone) {
-        netDone = YES;
-        Class sess = objc_getClass("NSURLSession");
-        o_dtReqCb = MKHook(sess, @selector(dataTaskWithRequest:completionHandler:), (IMP)h_dtReqCb, "Net_DataTaskReqCb");
-        o_dtReq   = MKHook(sess, @selector(dataTaskWithRequest:),                    (IMP)h_dtReq,   "Net_DataTaskReq");
-        o_dtUrlCb = MKHook(sess, @selector(dataTaskWithURL:completionHandler:),      (IMP)h_dtUrlCb, "Net_DataTaskUrlCb");
-        o_dtUrl   = MKHook(sess, @selector(dataTaskWithURL:),                        (IMP)h_dtUrl,   "Net_DataTaskUrl");
-        o_syncReq = MKHookClass(objc_getClass("NSURLConnection"),
-                                @selector(sendSynchronousRequest:returningResponse:error:),
-                                (IMP)h_syncReq, "NSURLConnection_syncReq");
-        MKLog(@"请求监控已装：4 个 dataTask 入口 + 同步请求（命中 map/location/verify/confirm 才打日志）");
-    }
+    [NSURLProtocol registerClass:[MKNetHookProtocol class]];
 
-    // ② 广告拦截：只在开关打开时启用
-    if (blockDone) return;
-    if (!CFG().adBlockOn) { MKLog(@"广告拦截未启用（adBlockOn=NO），仅保留请求监控"); return; }
+    // 把拦截器顶到 protocolClasses 第 0 位，压过 SDK 自己设的
+    o_setProtocolClasses = MKHook(objc_getClass("NSURLSessionConfiguration"),
+                                  MKSEL(setProtocolClasses:), (IMP)h_setProtocolClasses,
+                                  "AdBlock_SetProtocols");
 
-    [NSURLProtocol registerClass:[MKAdBlockProtocol class]];
-    gAdBlockActive = YES;
-    blockDone = YES;
+    // 仅做日志的 dataTask 入口（不参与改写，改写已交给 Protocol）
+    Class sess = objc_getClass("NSURLSession");
+    o_dtReqCb = MKHook(sess, @selector(dataTaskWithRequest:completionHandler:), (IMP)h_dtReqCb, "Net_DataTaskReqCb");
+    o_dtReq   = MKHook(sess, @selector(dataTaskWithRequest:),                    (IMP)h_dtReq,   "Net_DataTaskReq");
+    o_dtUrlCb = MKHook(sess, @selector(dataTaskWithURL:completionHandler:),      (IMP)h_dtUrlCb, "Net_DataTaskUrlCb");
+    o_dtUrl   = MKHook(sess, @selector(dataTaskWithURL:),                        (IMP)h_dtUrl,   "Net_DataTaskUrl");
+    o_syncReq = MKHookClass(objc_getClass("NSURLConnection"),
+                            @selector(sendSynchronousRequest:returningResponse:error:),
+                            (IMP)h_syncReq, "NSURLConnection_syncReq");
 
-    o_setProtocolClasses = MKHook(objc_getClass("NSURLSessionConfiguration"), MKSEL(setProtocolClasses:), (IMP)h_setProtocolClasses, "AdBlock_SetProtocols");
+    gAdBlockActive = CFG().adBlockOn;
 
-    MKLog(@"广告拦截已启用，关键字 %lu 条",
-          (unsigned long)[MKAdBlockProtocol mk_adKeywords].count);
+    MKLog(@"NET: protocol registered, adblock=%d, %lu keywords",
+          (int)gAdBlockActive, (unsigned long)[MKNetHookProtocol mk_adKeywords].count);
 }
 
 static void MKSafeInstall(void (*fn)(void), const char *name) { @try { fn(); } @catch (NSException *e) { MKLog(@"✗ 安装器 %s 抛异常: %@", name, e.reason); } @catch (id other) {} }
