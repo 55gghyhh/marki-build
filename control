@@ -1,0 +1,9 @@
+Package: com.mkf.markifake
+Name: MarkiFake
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 马克水印相机 16.4.1 造假插件（虚拟定位 / 像素级换图 / 拍摄时间 / 天气 / 风控归零）
+Maintainer: mkf
+Author: mkf
+Section: Tweaks
+Depends: firmware (>= 15.0)

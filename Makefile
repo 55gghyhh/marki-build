@@ -1,0 +1,13 @@
+TARGET = iphone:clang:latest:15.0
+ARCHS = arm64 arm64e
+
+include $(THEOS)/makefiles/common.mk
+
+TWEAK_NAME = MarkiFake
+
+MarkiFake_FILES = Tweak.x
+MarkiFake_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations -Wno-format
+MarkiFake_FRAMEWORKS = UIKit Foundation CoreLocation CoreVideo CoreImage CoreGraphics ImageIO Photos AVFoundation QuartzCore
+MarkiFake_LDFLAGS = -Wl,-undefined,dynamic_lookup
+
+include $(THEOS_MAKE_PATH)/tweak.mk
