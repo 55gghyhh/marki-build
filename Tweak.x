@@ -20,7 +20,6 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <libkern/OSCacheControl.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -348,7 +347,6 @@ static BOOL MKDrawIntoCI(CVPixelBufferRef pb, CGImageRef cg, size_t w, size_t h)
 static BOOL MKSwapPixelBuffer(CVPixelBufferRef pb, double token, const char *who) {
     if (!pb) return NO;
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-    NSString *tag = [NSString stringWithUTF8String:who];
     if (pb == gLastPB && token == gLastToken && (t0 - gLastSwapAt) < 3.0) return YES;
     UIImage *img = MKLoadSwapImage(NO, NO);
     if (!img) return NO;
