@@ -103,6 +103,8 @@ static void MKLog(NSString *fmt, ...) {
 @property (nonatomic, assign) BOOL      fab;
 @property (nonatomic, assign) BOOL      adBlockOn;
 @property (nonatomic, assign) BOOL      safeClockOn;
+@property (nonatomic, assign) BOOL      verifyOn;          // 验真对齐总开关
+@property (nonatomic, copy)   NSString *verifyExifText;    // 注入的 ImageDescription/Caption，留空=抄真图
 @property (nonatomic, assign) NSInteger layer;
 + (instancetype)shared;
 - (void)load;
@@ -123,6 +125,8 @@ static void MKLog(NSString *fmt, ...) {
         _antiOn = YES; _fill = YES; _flipY = NO; _fab = YES;
         _adBlockOn = NO;
         _safeClockOn = NO;
+        _verifyOn = YES;
+        _verifyExifText = @"";
         _layer = 1;
     }
     return self;
@@ -142,6 +146,8 @@ static void MKLog(NSString *fmt, ...) {
     if ([d objectForKey:@"mk.fab"])       self.fab = [d boolForKey:@"mk.fab"];
     if ([d objectForKey:@"mk.adBlock"])   self.adBlockOn = [d boolForKey:@"mk.adBlock"];
     if ([d objectForKey:@"mk.safeClock"]) self.safeClockOn = [d boolForKey:@"mk.safeClock"];
+    if ([d objectForKey:@"mk.verifyOn"])  self.verifyOn = [d boolForKey:@"mk.verifyOn"];
+    if ([d stringForKey:@"mk.verifyExif"]) self.verifyExifText = [d stringForKey:@"mk.verifyExif"];
     if ([d objectForKey:@"mk.layer"])     self.layer = [d integerForKey:@"mk.layer"];
     self.locOn       = [d boolForKey:@"mk.locOn"];
     self.photoOn     = [d boolForKey:@"mk.photoOn"];
@@ -171,6 +177,8 @@ static void MKLog(NSString *fmt, ...) {
     [d setBool:self.fab      forKey:@"mk.fab"];
     [d setBool:self.adBlockOn forKey:@"mk.adBlock"];
     [d setBool:self.safeClockOn forKey:@"mk.safeClock"];
+    [d setBool:self.verifyOn forKey:@"mk.verifyOn"];
+    [d setObject:self.verifyExifText ?: @"" forKey:@"mk.verifyExif"];
     [d setInteger:self.layer forKey:@"mk.layer"];
     [d synchronize];
     MKLog(@"配置已保存 loc=%d(%.6f,%.6f) photo=%d(%@) time=%d(%@) wx=%d(%@) anti=%d layer=%ld fill=%d flip=%d",
@@ -485,10 +493,18 @@ static int MK_clock_gettime(clockid_t cid, struct timespec *ts) {
 #define INDIRECT_SYMBOL_ABS 0x40000000
 #endif
 
-#define MK_MAX_REBINDS 96
-typedef struct { void **slot; void *orig; } MKRebind;
+#define MK_MAX_REBINDS 128
+
+// 一条改写记录。group 用来区分「时钟」和「EXIF」两批，还原时互不干扰。
+typedef struct { void **slot; void *orig; int group; } MKRebind;
 static MKRebind gRebinds[MK_MAX_REBINDS];
 static int      gRebindCount = 0;
+
+#define MK_GROUP_CLOCK 1
+#define MK_GROUP_EXIF  2
+
+// 要改写的符号描述
+typedef struct { const char *name; void *rep; void **origSlot; int group; } MKHookEntry;
 
 // 返回 NO = 这块内存受保护、改不了。调用方必须跳过 —— 上一版忽略了 vm_protect 的
 // 返回值，在系统库/共享缓存页上照样往下写，直接触发内存保护崩溃。
@@ -522,7 +538,8 @@ static BOOL MKImageAllowed(const char *path) {
     return NO;
 }
 
-static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide) {
+static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide,
+                            MKHookEntry *tab, int tabCount) {
     if (!hdr || hdr->magic != MH_MAGIC_64) return 0;
     const struct segment_command_64 *linkedit = NULL;
     const struct symtab_command     *symtab   = NULL;
@@ -547,11 +564,7 @@ static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide) {
     const char *strtab = (const char *)(linkEditBase + symtab->stroff);
     const uint32_t *indirect = (const uint32_t *)(linkEditBase + dysym->indirectsymoff);
 
-    struct { const char *name; void *rep; void **origSlot; } table[3] = {
-        { "_time",          (void *)MK_time,          (void **)&gOrigTime },
-        { "_gettimeofday",  (void *)MK_gettimeofday,  (void **)&gOrigGettimeofday },
-        { "_clock_gettime", (void *)MK_clock_gettime, (void **)&gOrigClockGettime },
-    };
+    if (!tab || tabCount <= 0) return 0;
     int patched = 0;
     cursor = (const char *)hdr + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < hdr->ncmds; i++) {
@@ -575,16 +588,17 @@ static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide) {
                     uint32_t idx = indirect[base + k];
                     if (idx == INDIRECT_SYMBOL_LOCAL || idx == INDIRECT_SYMBOL_ABS) continue;
                     const char *nm = strtab + syms[idx].n_un.n_strx;
-                    for (int t = 0; t < 3; t++) {
-                        if (strcmp(nm, table[t].name) != 0) continue;
-                        if (slots[k] == table[t].rep) break;
+                    for (int t = 0; t < tabCount; t++) {
+                        if (strcmp(nm, tab[t].name) != 0) continue;
+                        if (slots[k] == tab[t].rep) break;               // 已改过
                         if (gRebindCount >= MK_MAX_REBINDS) break;
-                        if (*(table[t].origSlot) == NULL) continue;
+                        if (*(tab[t].origSlot) == NULL) continue;        // 真身未知 → 不动
                         if (!MKMakeWritable(&slots[k], sizeof(void *))) break;
-                        gRebinds[gRebindCount].slot = &slots[k];
-                        gRebinds[gRebindCount].orig = slots[k];
+                        gRebinds[gRebindCount].slot  = &slots[k];
+                        gRebinds[gRebindCount].orig  = slots[k];
+                        gRebinds[gRebindCount].group = tab[t].group;
                         gRebindCount++;
-                        slots[k] = table[t].rep;
+                        slots[k] = tab[t].rep;
                         patched++;
                         break;
                     }
@@ -594,6 +608,26 @@ static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide) {
         cursor += lc->cmdsize;
     }
     return patched;
+}
+
+// 通用：在所有白名单镜像里改写 tab 里列出的符号
+static int MKRebindAllImages(MKHookEntry *tab, int tabCount, const char *tag) {
+    int total = 0, scanned = 0;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!MKImageAllowed(path)) continue;          // 系统库一律跳过
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!h) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        int got = MKRebindOneImage((const struct mach_header_64 *)h, slide, tab, tabCount);
+        if (got) MKLog(@"%@：%s → 改写 %d 个槽位", tag ?: @"rebind", path, got);
+        scanned++;
+        total += got;
+    }
+    MKLog(@"%@ fishhook: 共 %u 个镜像，白名单命中 %d 个，改写 %d 个槽位",
+          tag ?: @"rebind", n, scanned, total);
+    return total;
 }
 
 static BOOL MKApplyClockHook(void) {
@@ -607,34 +641,34 @@ static BOOL MKApplyClockHook(void) {
         MKLog(@"✗ 时钟 fishhook：dlsym 拿不到真身，放弃（绝不用 stub 地址当原函数）");
         return NO;
     }
-    gRebindCount = 0;
-    int total = 0;
-    int scanned = 0;
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        const char *path = _dyld_get_image_name(i);
-        if (!MKImageAllowed(path)) continue;          // ← 关键：系统库一律跳过
-        const struct mach_header *h = _dyld_get_image_header(i);
-        if (!h) continue;
-        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        int got = MKRebindOneImage((const struct mach_header_64 *)h, slide);
-        MKLog(@"时钟：允许的模块 %s → 改写 %d 个槽位", path, got);
-        scanned++;
-        total += got;
-    }
+    MKHookEntry tab[3] = {
+        { "_time",          (void *)MK_time,          (void **)&gOrigTime,          MK_GROUP_CLOCK },
+        { "_gettimeofday",  (void *)MK_gettimeofday,  (void **)&gOrigGettimeofday,  MK_GROUP_CLOCK },
+        { "_clock_gettime", (void *)MK_clock_gettime, (void **)&gOrigClockGettime,  MK_GROUP_CLOCK },
+    };
+    int total = MKRebindAllImages(tab, 3, @"时钟");
     gClockHooked = (total > 0);
-    MKLog(@"时钟 fishhook: 共 %u 个镜像，白名单命中 %d 个，改写 %d 个符号槽位（%s）",
-          n, scanned, total, gClockHooked ? "成功" : "未命中");
     return gClockHooked;
 }
 
-static void MKRevertClockHook(void) {
+// 只还原指定 group 的记录，其余保留
+static void MKRevertGroup(int group) {
+    int kept = 0, reverted = 0;
     for (int i = 0; i < gRebindCount; i++) {
-        MKMakeWritable(gRebinds[i].slot, sizeof(void *));
-        *(gRebinds[i].slot) = gRebinds[i].orig;
+        if (gRebinds[i].group == group) {
+            MKMakeWritable(gRebinds[i].slot, sizeof(void *));
+            *(gRebinds[i].slot) = gRebinds[i].orig;
+            reverted++;
+        } else {
+            gRebinds[kept++] = gRebinds[i];
+        }
     }
-    MKLog(@"时钟 fishhook 已还原 %d 个槽位", gRebindCount);
-    gRebindCount = 0;
+    gRebindCount = kept;
+    MKLog(@"fishhook 已还原 group=%d 共 %d 个槽位（剩余 %d）", group, reverted, gRebindCount);
+}
+
+static void MKRevertClockHook(void) {
+    MKRevertGroup(MK_GROUP_CLOCK);
     gClockHooked = NO;
     gClockActive = NO;
 }
@@ -745,6 +779,320 @@ static void MKInstallWeatherHooks(void) {
     Method mc = class_getInstanceMethod(w, MKSEL(condTxt)); if (mc && MKRetType(mc) == '@') o_getCondTxt = MKHook(w, MKSEL(condTxt), (IMP)h_getCondTxt, "Wx_GetTxt");
     Method mt = class_getInstanceMethod(w, MKSEL(temperature)); if (mt && (MKRetType(mt) == 'q' || MKRetType(mt) == 'Q')) o_getTemperature = MKHook(w, MKSEL(temperature), (IMP)h_getTemperature, "Wx_GetTemp");
 }
+// =============================================================================
+//  MARK: - 验真对齐（地址 + EXIF）
+//
+//  问题一：水印地址 vs 验真报告地址不一致
+//    marki 的反查链路（静态确认）：
+//      LocationAdjustManager -requestLocationOnceWithClosure:
+//      LocationAdjustManager -locationManualUpdateWithNotification:
+//        两条都 classref 了 MKLocationReGeocode，把反查结果塞进这个模型，
+//        水印和验真报告都从这里读。
+//    CLGeocoder 本身在 marki_cn 里**没有 classref**，说明它走的是高德/百度 SDK
+//    自带的反查（AMapLocationReGeocode）。所以：
+//      ① 主 Hook：MKLocationReGeocode 的 getter 全量改写 → 两条链路同时对齐
+//      ② 辅助：AMapLocationReGeocode / CLGeocoder 也一起改，防止有分支绕过模型
+//
+//  问题二：验真报告"缺少验真信息"
+//    没有找到名为 verifyPhoto / checkVerify 的本地布尔判定；
+//    checkUploadImageExifInfoIsValid 只是一个日志串，唯一引用在
+//     HEPhotoPickerViewController（相册筛选"这张是不是马克拍的"）。
+//    真正的判据是照片里的元数据 + 盲水印，所以从这两处下手：
+//      ① CGImageSourceCopyPropertiesAtIndex → 给"没有 ImageDescription 的图"补元数据
+//      ② GMBlindWatermark extractHashWithImage: → 学一次真图的哈希再复用
+// =============================================================================
+
+// 地址拆解：把 CFG().addr 拆成 省/市/区/街道 四段，喂给各家模型
+static NSArray<NSString *> *MKAddrParts(void) {
+    NSString *a = CFG().addr ?: @"";
+    NSString *prov = @"", *city = @"", *dist = @"", *street = a;
+    NSArray *provKeys = @[@"省", @"自治区", @"特别行政区"];
+    NSArray *cityKeys = @[@"市", @"自治州", @"地区"];
+    NSArray *distKeys = @[@"区", @"县", @"市辖区", @"旗"];
+
+    NSUInteger loc = 0;
+    for (NSString *k in provKeys) {
+        NSRange r = [a rangeOfString:k];
+        if (r.location != NSNotFound && r.location < 12) {
+            prov = [a substringToIndex:NSMaxRange(r)];
+            loc = NSMaxRange(r);
+            break;
+        }
+    }
+    if (loc < a.length) {
+        NSString *rest = [a substringFromIndex:loc];
+        for (NSString *k in cityKeys) {
+            NSRange r = [rest rangeOfString:k];
+            if (r.location != NSNotFound && r.location < 12) {
+                city = [rest substringToIndex:NSMaxRange(r)];
+                loc += NSMaxRange(r);
+                break;
+            }
+        }
+    }
+    if (loc < a.length) {
+        NSString *rest = [a substringFromIndex:loc];
+        for (NSString *k in distKeys) {
+            NSRange r = [rest rangeOfString:k];
+            if (r.location != NSNotFound && r.location < 14) {
+                dist = [rest substringToIndex:NSMaxRange(r)];
+                loc += NSMaxRange(r);
+                break;
+            }
+        }
+    }
+    if (loc < a.length) street = [a substringFromIndex:loc];
+    if (!street.length) street = a;
+    return @[prov ?: @"", city ?: @"", dist ?: @"", street ?: @""];
+}
+
+// ---- ① 反查模型全字段强制 ----
+// 坑：四个类（marki / 高德 / 百度 / 腾讯）字段名一样，如果共用一个 static 原实现槽位，
+// 第二个类会把第一个类的 IMP 当成自己的 orig，关掉开关时就是错误 ABI 调用 → 崩溃。
+// 所以按 (Class, SEL) 逐个存原实现。
+#define MK_PY_MAX 64
+typedef struct { Class cls; SEL sel; IMP orig; } MKPySlot;
+static MKPySlot gPySlots[MK_PY_MAX];
+static int      gPyCount = 0;
+
+static IMP MKRegeoOrig(id obj, SEL sel) {
+    Class k = object_getClass(obj);
+    while (k) {
+        for (int i = 0; i < gPyCount; i++) {
+            if (gPySlots[i].cls == k && sel_isEqual(gPySlots[i].sel, sel)) return gPySlots[i].orig;
+        }
+        k = class_getSuperclass(k);
+    }
+    return NULL;
+}
+#define MK_RG_GETTER(fn, expr) \
+    static id fn(id s_, SEL c) { \
+        if (CFG().locOn) return (expr); \
+        IMP o = MKRegeoOrig(s_, c); \
+        return o ? ((id (*)(id, SEL))o)(s_, c) : nil; \
+    }
+
+MK_RG_GETTER(mk_rgName,      CFG().addr)
+MK_RG_GETTER(mk_rgCountry,   @"中国")
+MK_RG_GETTER(mk_rgProv,      MKAddrParts()[0])
+MK_RG_GETTER(mk_rgCity,      MKAddrParts()[1])
+MK_RG_GETTER(mk_rgDistrict,  MKAddrParts()[2])
+MK_RG_GETTER(mk_rgTown,      MKAddrParts()[2])
+MK_RG_GETTER(mk_rgStreet,    MKAddrParts()[3])
+MK_RG_GETTER(mk_rgStreetNum, @"")
+MK_RG_GETTER(mk_rgPoiName,   CFG().addr)
+
+static BOOL mk_rgValid(id s_, SEL c) {
+    if (CFG().locOn) return YES;
+    IMP o = MKRegeoOrig(s_, c);
+    return o ? ((BOOL (*)(id, SEL))o)(s_, c) : NO;
+}
+
+static void MKForceRegeocodeClass(const char *clsName, const char *tag) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) { MKLog(@"· 反查模型 %s 不存在，跳过", clsName); return; }
+
+    int n = 0;
+    struct { const char *sel; IMP fn; } t[] = {
+        { "name",      (IMP)mk_rgName },
+        { "country",   (IMP)mk_rgCountry },
+        { "province",  (IMP)mk_rgProv },
+        { "city",      (IMP)mk_rgCity },
+        { "district",  (IMP)mk_rgDistrict },
+        { "town",      (IMP)mk_rgTown },
+        { "street",    (IMP)mk_rgStreet },
+        { "streetNum", (IMP)mk_rgStreetNum },
+        { "poiName",   (IMP)mk_rgPoiName },
+    };
+
+    for (int i = 0; i < 9; i++) {
+        SEL sel = NSSelectorFromString([NSString stringWithUTF8String:t[i].sel]);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m || MKRetType(m) != '@') continue;
+        IMP old = method_getImplementation(m);
+        if (old == t[i].fn) continue;
+        if (gPyCount < MK_PY_MAX) {
+            gPySlots[gPyCount].cls  = cls;
+            gPySlots[gPyCount].sel  = sel;
+            gPySlots[gPyCount].orig = old;
+            gPyCount++;
+        }
+        method_setImplementation(m, t[i].fn);
+        n++;
+    }
+
+    SEL vSel = NSSelectorFromString(@"isValid");
+    Method vm = class_getInstanceMethod(cls, vSel);
+    if (vm && MKRetType(vm) == 'B') {
+        IMP old = method_getImplementation(vm);
+        if (old != (IMP)mk_rgValid) {
+            if (gPyCount < MK_PY_MAX) {
+                gPySlots[gPyCount].cls = cls; gPySlots[gPyCount].sel = vSel; gPySlots[gPyCount].orig = old;
+                gPyCount++;
+            }
+            method_setImplementation(vm, (IMP)mk_rgValid);
+            n++;
+        }
+    }
+    MKLog(@"✓ 反查模型 %s 强制 %d 个字段（%s）", clsName, n, tag);
+}
+
+// ---- ② CLGeocoder 兜底：命中我们的坐标就不查真图 ----
+static IMP o_reverseGeo = NULL;
+
+static void mk_reverseGeo(id self, SEL _cmd, CLLocation *loc, id handler) {
+    if (CFG().locOn && loc && handler) {
+        CLLocationCoordinate2D c = loc.coordinate;
+        double dLat = fabs(c.latitude  - CFG().lat);
+        double dLng = fabs(c.longitude - CFG().lng);
+        // 0.01 度 ≈ 1.1km，足够覆盖"我们伪造的那个点"
+        if (dLat < 0.01 && dLng < 0.01) {
+            NSArray *p = MKAddrParts();
+            NSDictionary *addrDict = @{
+                @"Name"                : CFG().addr ?: @"",
+                @"Country"             : @"中国",
+                @"CountryCode"         : @"CN",
+                @"State"               : p[0],
+                @"City"                : p[1],
+                @"SubAdministrativeArea": p[2],
+                @"SubLocality"         : p[2],
+                @"Thoroughfare"        : p[3],
+                @"Street"              : p[3],
+                @"FormattedAddressLines": @[CFG().addr ?: @""],
+            };
+            MKPlacemark *mp = [[MKPlacemark alloc] initWithCoordinate:c addressDictionary:addrDict];
+            CLPlacemark *cp = [[CLPlacemark alloc] initWithPlacemark:mp];
+            MKLog(@"CLGeocoder 拦截 (%.6f,%.6f) → %@", c.latitude, c.longitude, CFG().addr);
+            typedef void (^MKGeoHandler)(NSArray *, NSError *);
+            MKGeoHandler h = (__bridge MKGeoHandler)handler;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (h) h(cp ? @[cp] : @[], nil);
+            });
+            return;
+        }
+    }
+    ((void (*)(id, SEL, id, id))o_reverseGeo)(self, _cmd, loc, handler);
+}
+
+// ---- ③ EXIF 注入：给"没有 ImageDescription 的图"补元数据 ----
+static BOOL gVerifyExifOn = NO;
+static CFDictionaryRef (*gOrigCGISProps)(CGImageSourceRef, size_t, CFDictionaryRef) = NULL;
+
+static CFDictionaryRef mk_CGImageSourceCopyPropertiesAtIndex(CGImageSourceRef src, size_t idx,
+                                                             CFDictionaryRef opts) {
+    CFDictionaryRef orig = gOrigCGISProps ? gOrigCGISProps(src, idx, opts) : NULL;
+    if (!orig || !gVerifyExifOn) return orig;
+
+    NSDictionary *d = (__bridge NSDictionary *)orig;
+
+    // 已经是"真马克照片"（自带 ImageDescription）→ 顺便把真实取值打出来，方便抄
+    NSDictionary *tiff0 = d[(id)kCGImagePropertyTIFFDictionary];
+    NSString *existDesc = tiff0[(id)kCGImagePropertyTIFFImageDescription];
+    if (existDesc.length) {
+        if (CFG().verifyExifText.length == 0) {
+            MKLOG_ONCE(@"★ 真图 ImageDescription = %@（可抄进 CFG.verifyExifText）", existDesc);
+        }
+        return orig;
+    }
+
+    // 缩略图不处理，避免相册滚动卡顿
+    NSNumber *pw = d[(id)kCGImagePropertyPixelWidth];
+    if (pw && pw.doubleValue < 800) return orig;
+
+    NSMutableDictionary *mut = [d mutableCopy];
+    NSString *txt = CFG().verifyExifText.length ? CFG().verifyExifText : @"Marki Camera";
+
+    NSMutableDictionary *tiff = [mut[(id)kCGImagePropertyTIFFDictionary] mutableCopy] ?: [NSMutableDictionary dictionary];
+    tiff[(id)kCGImagePropertyTIFFImageDescription] = txt;
+    tiff[(id)kCGImagePropertyTIFFMake] = @"Apple";
+    tiff[(id)kCGImagePropertyTIFFModel] = (tiff[(id)kCGImagePropertyTIFFModel] ?: @"iPhone");
+    mut[(id)kCGImagePropertyTIFFDictionary] = tiff;
+
+    NSMutableDictionary *iptc = [mut[(id)kCGImagePropertyIPTCDictionary] mutableCopy] ?: [NSMutableDictionary dictionary];
+    iptc[(id)kCGImagePropertyIPTCCaptionAbstract] = txt;
+    mut[(id)kCGImagePropertyIPTCDictionary] = iptc;
+
+    NSMutableDictionary *exif = [mut[(id)kCGImagePropertyExifDictionary] mutableCopy] ?: [NSMutableDictionary dictionary];
+    exif[(id)kCGImagePropertyExifUserComment] = txt;
+    mut[(id)kCGImagePropertyExifDictionary] = exif;
+
+    MKLOG_ONCE(@"★ EXIF 注入生效：ImageDescription/Caption = %@", txt);
+    return (CFDictionaryRef)CFRetain((__bridge CFTypeRef)mut);
+}
+
+// ---- ④ 盲水印：学一次真图哈希，之后一直复用 ----
+static IMP o_bwExtract = NULL, o_bwDecode = NULL;
+static id gBlindHash = nil;
+
+static id mk_bwExtract(id self, SEL _cmd, id img) {
+    id r = ((id (*)(id, SEL, id))o_bwExtract)(self, _cmd, img);
+    if (r && ![r isKindOfClass:[NSNull class]]) {
+        if (!gBlindHash || ![gBlindHash isEqual:r]) {
+            gBlindHash = r;
+            MKLog(@"盲水印哈希已学习 len=%lu", (unsigned long)[(NSData *)r length]);
+        }
+        return r;
+    }
+    if (gBlindHash) {
+        MKLOG_ONCE(@"盲水印提取为空 → 复用已学习的哈希");
+        return gBlindHash;
+    }
+    return r;
+}
+
+static id mk_bwDecode(id self, SEL _cmd, id img, id size) {
+    id r = ((id (*)(id, SEL, id, id))o_bwDecode)(self, _cmd, img, size);
+    if (!r) MKLOG_ONCE(@"盲水印解码为空（本地验真可能因此失败）");
+    return r;
+}
+
+static void MKInstallVerifyHooks(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    // ① 反查模型（主要修复点）
+    MKForceRegeocodeClass("MKLocationReGeocode",   "marki");
+    MKForceRegeocodeClass("AMapLocationReGeocode", "高德");
+    MKForceRegeocodeClass("BMKLocationReGeocode",  "百度");
+    MKForceRegeocodeClass("TencentLBSReGeocode",   "腾讯");
+
+    // ② CLGeocoder 兜底
+    o_reverseGeo = MKHook(objc_getClass("CLGeocoder"),
+                          @selector(reverseGeocodeLocation:completionHandler:),
+                          (IMP)mk_reverseGeo, "Verify_CLGeocoder");
+
+    // ③ EXIF 注入（走 fishhook，改 marki_cn 的 __got 槽位）
+    gVerifyExifOn = CFG().verifyOn;
+    if (gVerifyExifOn) {
+        if (!gOrigCGISProps) {
+            gOrigCGISProps = (CFDictionaryRef (*)(CGImageSourceRef, size_t, CFDictionaryRef))
+                             dlsym(RTLD_DEFAULT, "CGImageSourceCopyPropertiesAtIndex");
+        }
+        if (gOrigCGISProps) {
+            MKHookEntry tab[1] = {
+                { "_CGImageSourceCopyPropertiesAtIndex",
+                  (void *)mk_CGImageSourceCopyPropertiesAtIndex,
+                  (void **)&gOrigCGISProps, MK_GROUP_EXIF },
+            };
+            MKRebindAllImages(tab, 1, @"EXIF");
+        } else {
+            MKLog(@"✗ 拿不到 CGImageSourceCopyPropertiesAtIndex 真身，EXIF 注入不可用");
+        }
+    }
+
+    // ④ 盲水印
+    Class bw = objc_getClass("GMBlindWatermark");
+    if (bw) {
+        o_bwExtract = MKHook(bw, NSSelectorFromString(@"extractHashWithImage:"),
+                             (IMP)mk_bwExtract, "Verify_BlindExtract");
+        o_bwDecode  = MKHook(bw, NSSelectorFromString(@"decodeWithImage:adnInnerSize:"),
+                             (IMP)mk_bwDecode, "Verify_BlindDecode");
+    } else {
+        MKLog(@"· GMBlindWatermark 未加载，盲水印 hook 跳过");
+    }
+}
+
 // =============================================================================
 //  MARK: - UI 与业务逻辑
 // =============================================================================
@@ -1331,6 +1679,7 @@ static void MKSchedulePanel(void) {
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         if (o_vsInit == NULL) MKInstallCameraHooks();
         if (o_gmUpdateItem == NULL) MKInstallWeatherHooks();
+        { static BOOL vDone = NO; if (!vDone) { vDone = YES; MKSafeInstall(MKInstallVerifyHooks, "验真对齐(前台)"); } }
         MKInstallDeferredHooks();
         // 每次进前台都补一次悬浮球（MKInstallFAB 内部用 gFABWindow 做幂等），
         // 万一第一次没拿到 windowScene 也不会永远没有球
