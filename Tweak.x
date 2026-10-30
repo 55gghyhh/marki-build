@@ -103,6 +103,7 @@ static void MKLog(NSString *fmt, ...) {
 @property (nonatomic, assign) BOOL      fab;
 @property (nonatomic, assign) BOOL      adBlockOn;
 @property (nonatomic, assign) BOOL      safeClockOn;
+@property (nonatomic, assign) NSInteger clockScope;       // 0=关 1=只GPUMarkSDK(安全,默认) 2=白名单全开
 @property (nonatomic, assign) BOOL      verifyOn;          // 验真对齐总开关
 @property (nonatomic, copy)   NSString *verifyExifText;    // 注入的 ImageDescription/Caption，留空=抄真图
 @property (nonatomic, assign) NSInteger layer;
@@ -125,6 +126,7 @@ static void MKLog(NSString *fmt, ...) {
         _antiOn = YES; _fill = YES; _flipY = NO; _fab = YES;
         _adBlockOn = NO;
         _safeClockOn = NO;
+        _clockScope = 1;
         _verifyOn = YES;
         _verifyExifText = @"";
         _layer = 1;
@@ -146,6 +148,7 @@ static void MKLog(NSString *fmt, ...) {
     if ([d objectForKey:@"mk.fab"])       self.fab = [d boolForKey:@"mk.fab"];
     if ([d objectForKey:@"mk.adBlock"])   self.adBlockOn = [d boolForKey:@"mk.adBlock"];
     if ([d objectForKey:@"mk.safeClock"]) self.safeClockOn = [d boolForKey:@"mk.safeClock"];
+    if ([d objectForKey:@"mk.clockScope"]) self.clockScope = [d integerForKey:@"mk.clockScope"];
     if ([d objectForKey:@"mk.verifyOn"])  self.verifyOn = [d boolForKey:@"mk.verifyOn"];
     if ([d stringForKey:@"mk.verifyExif"]) self.verifyExifText = [d stringForKey:@"mk.verifyExif"];
     if ([d objectForKey:@"mk.layer"])     self.layer = [d integerForKey:@"mk.layer"];
@@ -177,6 +180,7 @@ static void MKLog(NSString *fmt, ...) {
     [d setBool:self.fab      forKey:@"mk.fab"];
     [d setBool:self.adBlockOn forKey:@"mk.adBlock"];
     [d setBool:self.safeClockOn forKey:@"mk.safeClock"];
+    [d setInteger:self.clockScope forKey:@"mk.clockScope"];
     [d setBool:self.verifyOn forKey:@"mk.verifyOn"];
     [d setObject:self.verifyExifText ?: @"" forKey:@"mk.verifyExif"];
     [d setInteger:self.layer forKey:@"mk.layer"];
@@ -538,6 +542,7 @@ static int MK_clock_gettime(clockid_t cid, struct timespec *ts) {
 #endif
 
 #define MK_MAX_REBINDS 128
+#define MK_MAX_PER_IMAGE 4          // 单个镜像最多改几个槽位，防止"一改改一片"
 
 // 一条改写记录。group 用来区分「时钟」和「EXIF」两批，还原时互不干扰。
 typedef struct { void **slot; void *orig; int group; } MKRebind;
@@ -565,17 +570,49 @@ static BOOL MKMakeWritable(void *addr, size_t len) {
     return YES;
 }
 
-// ---- 模块白名单：只允许动这三个，系统库一个字节都不碰 ----
+// ---- 作用域：0=关  1=只动 GPUMarkSDK（安全，推荐）  2=白名单全开（激进） ----
+static int  gClockScope = 1;
+static BOOL gAllowLazyPtr = NO;        // 是否允许改 __la_symbol_ptr（默认禁止）
+
+// 二次硬拒名单：这些块即使路径里含白名单关键字也一律跳过。
+// Flutter / App.framework 带 AOT 快照，改写 GOT 后 JIT/AOT 校验会直接 abort；
+// 广告 SDK 自己的心跳线程对时间极敏感，改了就是随机闪退。
+static BOOL MKImageBlacklisted(const char *path) {
+    static const char *bad[] = {
+        "Flutter", "App.framework", "libapp.so", "vm_snapshot",
+        "AnyThinkSDK", "GDTMobSDK", "CSJ", "pangle", "QuMengAdSDK", "Sigmob",
+        "Smartdigimkt", "AliyunOSSiOS", "Tquic", "Agora", "TTSDK", "Sentry",
+        "SkyMediaSDK", "ardancegame", "facedancegame", "vn_", "of_effect",
+        "of_pose", "of_avatar", "opencv", "yoga", NULL
+    };
+    for (int i = 0; bad[i]; i++) {
+        if (strstr(path, bad[i])) return YES;
+    }
+    return NO;
+}
+
+// ---- 模块白名单 ----
 static BOOL MKImageAllowed(const char *path) {
     if (!path) return NO;
-    // 硬拒绝：系统库、系统框架、dyld 共享缓存、开发者目录
+
+    // 硬拒绝：系统库、系统框架、共享缓存、开发者目录
     if (strncmp(path, "/usr/lib/", 9) == 0)          return NO;
     if (strncmp(path, "/System/Library/", 16) == 0)  return NO;
     if (strncmp(path, "/System/", 8) == 0)           return NO;
     if (strncmp(path, "/Developer/", 11) == 0)       return NO;
     if (strstr(path, "/usr/lib/dyld"))               return NO;
     if (strstr(path, "libsystem_"))                  return NO;
-    // 白名单（子串匹配，兼容 .app/Frameworks/xxx.framework/xxx 这种路径）
+
+    // 二次拒绝
+    if (MKImageBlacklisted(path)) return NO;
+
+    // scope 1：只碰水印渲染器。GLCameraSDK 有 60fps 渲染线程，marki_cn 里有全部广告 SDK，
+    // 两边都不该被改 —— 这是上一版 56 个槽位之后 10 秒闪退的直接原因。
+    if (gClockScope <= 1) {
+        return (strstr(path, "GPUMarkSDK") != NULL);
+    }
+
+    // scope 2：白名单全开（仍然受黑名单限制）
     if (strstr(path, "marki_cn"))      return YES;
     if (strstr(path, "GLCameraSDK"))   return YES;
     if (strstr(path, "GPUMarkSDK"))    return YES;
@@ -609,6 +646,8 @@ static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide,
     const uint32_t *indirect = (const uint32_t *)(linkEditBase + dysym->indirectsymoff);
 
     if (!tab || tabCount <= 0) return 0;
+    if (gRebindCount >= MK_MAX_REBINDS) return 0;      // 全局配额已满
+
     int patched = 0;
     cursor = (const char *)hdr + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < hdr->ncmds; i++) {
@@ -616,33 +655,80 @@ static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide,
         if (lc->cmdsize < sizeof(struct load_command)) break;
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-            BOOL pacSegment = (strncmp(sg->segname, "__AUTH", 6) == 0);
+
+            // ① 段级硬判定：只接受 __DATA / __DATA_CONST。
+            //    __AUTH* 是指针认证区（写了必 PAC 失败）；__TEXT 只读；
+            //    其它段（__LINKEDIT / __LLVM_COV）根本不存放指针。
+            BOOL segAuth  = (strncmp(sg->segname, "__AUTH", 6) == 0);
+            BOOL segData  = (strcmp(sg->segname, "__DATA") == 0);
+            BOOL segDCon  = (strcmp(sg->segname, "__DATA_CONST") == 0);
+            if (segAuth || (!segData && !segDCon)) { cursor += lc->cmdsize; continue; }
+
+            // ② 段可写性校验：不可写且不是 __DATA_CONST 的，一律跳过
+            if (!segDCon && !(sg->initprot & VM_PROT_WRITE)) { cursor += lc->cmdsize; continue; }
+
             const char *sectAddr = (const char *)sg + sizeof(struct segment_command_64);
             for (uint32_t si = 0; si < sg->nsects; si++) {
                 const struct section_64 *sec = (const struct section_64 *)(sectAddr + si * sizeof(struct section_64));
-                BOOL isGot  = (strcmp(sec->sectname, "__got") == 0) || (strcmp(sec->sectname, "__nl_symbol_ptr") == 0);
+
+                BOOL isGot  = (strcmp(sec->sectname, "__got") == 0) ||
+                              (strcmp(sec->sectname, "__nl_symbol_ptr") == 0);
                 BOOL isLazy = (strcmp(sec->sectname, "__la_symbol_ptr") == 0);
+
+                // ③ __la_symbol_ptr 默认完全禁止：
+                //    惰性绑定槽位在首次调用前指向 dyld_stub_binder 跳板，
+                //    改写它等于欺骗 dyld 的绑定流程，是 10 秒后随机崩溃的头号来源。
+                if (isLazy && !gAllowLazyPtr) continue;
                 if (!isGot && !isLazy) continue;
-                if (pacSegment) continue;
+
+                // ④ 范围校验：section 必须完整落在本段文件映射内
                 if (sec->offset == 0 || sec->size == 0) continue;
+                if (sec->addr < sg->vmaddr) continue;
+                if (sec->addr + sec->size > sg->vmaddr + sg->vmsize) continue;
+                if (sec->size % sizeof(void *) != 0) continue;
+
                 uint32_t count = (uint32_t)(sec->size / sizeof(void *));
                 uint32_t base  = sec->reserved1;
                 void **slots = (void **)((char *)hdr + sec->offset);
+
                 for (uint32_t k = 0; k < count; k++) {
+                    if (patched >= MK_MAX_PER_IMAGE) break;          // ⑤ 每镜像上限
+                    if (gRebindCount >= MK_MAX_REBINDS) break;
+
                     uint32_t idx = indirect[base + k];
                     if (idx == INDIRECT_SYMBOL_LOCAL || idx == INDIRECT_SYMBOL_ABS) continue;
+                    if (idx >= symtab->nsyms) continue;
                     const char *nm = strtab + syms[idx].n_un.n_strx;
+                    if (!nm || !nm[0]) continue;
+
                     for (int t = 0; t < tabCount; t++) {
                         if (strcmp(nm, tab[t].name) != 0) continue;
                         if (slots[k] == tab[t].rep) break;               // 已改过
-                        if (gRebindCount >= MK_MAX_REBINDS) break;
-                        if (*(tab[t].origSlot) == NULL) continue;        // 真身未知 → 不动
+                        if (*(tab[t].origSlot) == NULL) break;           // 真身未知 → 不动
+
+                        // ⑥ 去重：同一地址只记一次
+                        BOOL dup = NO;
+                        for (int d = 0; d < gRebindCount; d++) {
+                            if (gRebinds[d].slot == &slots[k]) { dup = YES; break; }
+                        }
+                        if (dup) break;
+
                         if (!MKMakeWritable(&slots[k], sizeof(void *))) break;
+
+                        void *oldPtr = slots[k];
+                        slots[k] = tab[t].rep;
+
+                        // ⑦ 写后校验：读回不一致就立刻还原，绝不留半改状态
+                        if (slots[k] != tab[t].rep) {
+                            slots[k] = oldPtr;
+                            MKLog(@"✗ 写后校验失败 %s（%s）→ 已还原", nm, sg->segname);
+                            break;
+                        }
+
                         gRebinds[gRebindCount].slot  = &slots[k];
-                        gRebinds[gRebindCount].orig  = slots[k];
+                        gRebinds[gRebindCount].orig  = oldPtr;
                         gRebinds[gRebindCount].group = tab[t].group;
                         gRebindCount++;
-                        slots[k] = tab[t].rep;
                         patched++;
                         break;
                     }
@@ -671,11 +757,21 @@ static int MKRebindAllImages(MKHookEntry *tab, int tabCount, const char *tag) {
     }
     MKLog(@"%s fishhook: 共 %u 个镜像，白名单命中 %d 个，改写 %d 个槽位",
           tag ? tag : "rebind", n, scanned, total);
+    if (total > 12) {
+        MKLog(@"⚠ 槽位数 %d 偏多：如果是时钟，建议把 clockScope 改成 1（只动 GPUMarkSDK）", total);
+    }
     return total;
 }
 
 static BOOL MKApplyClockHook(void) {
     if (gClockHooked) return YES;
+
+    // 每次安装前从配置刷新作用域
+    gClockScope   = (int)CFG().clockScope;
+    gAllowLazyPtr = (gClockScope >= 2);
+    MKLog(@"时钟 fishhook: scope=%d（1=只 GPUMarkSDK 安全 / 2=白名单全开） lazy=%d",
+          gClockScope, (int)gAllowLazyPtr);
+
     if (!gOrigTime || !gOrigGettimeofday || !gOrigClockGettime) {
         gOrigTime          = (time_t (*)(time_t *))dlsym(RTLD_DEFAULT, "time");
         gOrigGettimeofday  = (int (*)(struct timeval *, void *))dlsym(RTLD_DEFAULT, "gettimeofday");
@@ -742,6 +838,39 @@ static void MKSetSafeClock(BOOL on) {
     }
     [c save];
     MKRecomputeTimeDelta();
+}
+
+// 安全模式：0=关 1=只 GPUMarkSDK（默认/推荐） 2=白名单全开
+static void MKSetClockScope(int scope) {
+    MKFakeCfg *c = CFG();
+    if (scope < 0) scope = 0;
+    if (scope > 2) scope = 2;
+
+    // 先整体还原，再按新作用域重装，避免旧槽位残留
+    MKRevertClockHook();
+
+    c.clockScope = scope;
+    c.safeClockOn = (scope > 0);
+    gClockScope = scope;
+    gAllowLazyPtr = (scope >= 2);
+
+    if (scope == 0) {
+        [c save];
+        MKRecomputeTimeDelta();
+        MKLog(@"底层时钟：已关闭");
+        return;
+    }
+
+    BOOL ok = MKApplyClockHook();
+    [c save];
+    MKRecomputeTimeDelta();
+    MKLog(@"底层时钟：scope=%d 安装%s", scope, ok ? "成功" : "失败（未命中槽位）");
+    if (!ok) {
+        MKAlert(@"时钟 Hook 未命中",
+                scope == 1
+                  ? @"GPUMarkSDK 里没有可改写的 __got 槽位。可切到「全开」再试，但风险更高。"
+                  : @"所有白名单镜像都没命中 __got。此设备/此版本可能不支持底层时钟。");
+    }
 }
 
 static IMP o_stringFromDate = NULL, o_dateNow = NULL, o_dateNowClass = NULL;
@@ -1285,6 +1414,85 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
     dLng = (dLng * 180.0) / (MK_AXIS / sq * cos(radLat) * MK_PI); return CLLocationCoordinate2DMake(lat - dLat, lng - dLng);
 }
 
+// ============================================================================
+//  问题一：坐标系互转
+//    iOS CoreLocation / CLLocationManager   → WGS-84
+//    苹果地图 MKMapView.centerCoordinate    → GCJ-02
+//    腾讯 / 高德                             → GCJ-02
+//    百度 BMKLocationManager                 → BD-09
+//  CFG 里统一存 WGS-84。喂给各家 SDK 时按它自己的基准换算，
+//  否则百度会把"WGS 当成 BD"再反算一次，结果偏 400~600 米 —— 这就是水印和验真对不上的根因。
+// ============================================================================
+static CLLocationCoordinate2D MKGCJ02FromWGS84(double lat, double lng) {
+    if (MKOutOfChina(lat, lng)) return CLLocationCoordinate2DMake(lat, lng);
+    double dLat = MKTransLat(lng - 105.0, lat - 35.0);
+    double dLng = MKTransLng(lng - 105.0, lat - 35.0);
+    double radLat = lat / 180.0 * MK_PI;
+    double magic = sin(radLat);
+    magic = 1 - MK_EE * magic * magic;
+    double sq = sqrt(magic);
+    dLat = (dLat * 180.0) / ((MK_AXIS * (1 - MK_EE)) / (magic * sq) * MK_PI);
+    dLng = (dLng * 180.0) / (MK_AXIS / sq * cos(radLat) * MK_PI);
+    return CLLocationCoordinate2DMake(lat + dLat, lng + dLng);
+}
+
+// BD-09 ← GCJ-02（百度官方算法）
+static CLLocationCoordinate2D MKBD09FromGCJ02(double lat, double lng) {
+    const double x_pi = MK_PI * 3000.0 / 180.0;
+    double z = sqrt(lng * lng + lat * lat) + 0.00002 * sin(lat * x_pi);
+    double theta = atan2(lat, lng) + 0.000003 * cos(lng * x_pi);
+    return CLLocationCoordinate2DMake(z * sin(theta) + 0.006, z * cos(theta) + 0.0065);
+}
+
+static CLLocationCoordinate2D MKBD09FromWGS84(double lat, double lng) {
+    CLLocationCoordinate2D g = MKGCJ02FromWGS84(lat, lng);
+    return MKBD09FromGCJ02(g.latitude, g.longitude);
+}
+
+// 当前配置坐标的三种基准
+static CLLocationCoordinate2D MKCoordWGS84(void) { return CLLocationCoordinate2DMake(CFG().lat, CFG().lng); }
+static CLLocationCoordinate2D MKCoordGCJ02(void) { return MKGCJ02FromWGS84(CFG().lat, CFG().lng); }
+static CLLocationCoordinate2D MKCoordBD09(void)  { return MKBD09FromWGS84(CFG().lat, CFG().lng); }
+
+// ---- 百度：-[BMKLocation location] 必须是 BD-09 ----
+static IMP o_bmkLoc = NULL;
+static id mk_bmkLoc(id self, SEL _cmd) {
+    if (CFG().locOn) {
+        CLLocationCoordinate2D bd = MKCoordBD09();
+        MKLOG_ONCE(@"百度 BMKLocation.location → BD-09 %.6f,%.6f（源 WGS %.6f,%.6f）",
+                   bd.latitude, bd.longitude, CFG().lat, CFG().lng);
+        return [[CLLocation alloc] initWithLatitude:bd.latitude longitude:bd.longitude];
+    }
+    return ((id (*)(id, SEL))o_bmkLoc)(self, _cmd);
+}
+
+// ---- 腾讯：-[TencentLBSLocation location] 必须是 GCJ-02 ----
+static IMP o_tnkLoc = NULL;
+static id mk_tnkLoc(id self, SEL _cmd) {
+    if (CFG().locOn) {
+        CLLocationCoordinate2D gcj = MKCoordGCJ02();
+        MKLOG_ONCE(@"腾讯 TencentLBSLocation.location → GCJ-02 %.6f,%.6f", gcj.latitude, gcj.longitude);
+        return [[CLLocation alloc] initWithLatitude:gcj.latitude longitude:gcj.longitude];
+    }
+    return ((id (*)(id, SEL))o_tnkLoc)(self, _cmd);
+}
+
+// ---- 高德：-[AMapLocationReGeocode ...] 已由验真段的模型 hook 覆盖，这里只补 CLLocation ----
+static void MKInstallDatumHooks(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    o_bmkLoc = MKHook(objc_getClass("BMKLocation"), NSSelectorFromString(@"location"),
+                      (IMP)mk_bmkLoc, "Datum_BMKLocation");
+    o_tnkLoc = MKHook(objc_getClass("TencentLBSLocation"), NSSelectorFromString(@"location"),
+                      (IMP)mk_tnkLoc, "Datum_TencentLBS");
+
+    CLLocationCoordinate2D w = MKCoordWGS84(), g = MKCoordGCJ02(), b = MKCoordBD09();
+    MKLog(@"坐标系基准 WGS=(%.6f,%.6f) GCJ=(%.6f,%.6f) BD=(%.6f,%.6f)",
+          w.latitude, w.longitude, g.latitude, g.longitude, b.latitude, b.longitude);
+}
+
 @interface MKMapPickerViewController : UIViewController <MKMapViewDelegate, CLLocationManagerDelegate>
 @property (nonatomic, copy) void (^onPick)(double lat, double lng, NSString *addr);
 @property (nonatomic, strong) MKMapView *mapView;
@@ -1329,6 +1537,9 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
 - (void)mapViewDidChangeVisibleRegion:(MKMapView *)mapView { [self updateCoordLabels]; }
 - (void)updateCoordLabels {
     CLLocationCoordinate2D gcj = self.mapView.centerCoordinate, wgs = MKWGS84FromGCJ02(gcj.latitude, gcj.longitude);
+    CLLocationCoordinate2D bd = MKBD09FromWGS84(wgs.latitude, wgs.longitude);
+    MKLog(@"地图确定 GCJ=(%.6f,%.6f) → 存 WGS=(%.6f,%.6f) → 百度用 BD=(%.6f,%.6f)",
+          gcj.latitude, gcj.longitude, wgs.latitude, wgs.longitude, bd.latitude, bd.longitude);
     _coordLabel.text = [NSString stringWithFormat:@"地图 GCJ-02 %.6f, %.6f", gcj.latitude, gcj.longitude]; _addrLabel.text = [NSString stringWithFormat:@"保存 WGS-84 %.6f, %.6f", wgs.latitude, wgs.longitude];
 }
 - (void)topBarTap:(UIButton *)b {
@@ -1467,9 +1678,12 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
     MKFakeCfg *c = CFG();
     [self.switches[0] setOn:c.locOn animated:NO]; [self.switches[1] setOn:c.timeOn animated:NO]; [self.switches[2] setOn:c.wxOn animated:NO]; [self.switches[3] setOn:c.photoOn animated:NO]; [self.switches[4] setOn:c.safeClockOn animated:NO]; [self.switches[5] setOn:c.adBlockOn animated:NO]; [self.switches[6] setOn:c.antiOn animated:NO];
     NSString *(^Y)(BOOL) = ^NSString *(BOOL on) { return on ? @"开" : @"关"; };
-    self.statusLabel.text = [NSString stringWithFormat:@"定位：%@  时间：%@  替拍：%@\n天气：%@  反作弊：%@\n时钟：%@  广告：%@", Y(c.locOn), Y(c.timeOn), Y(c.photoOn), Y(c.wxOn), Y(c.antiOn), c.safeClockOn ? (gClockHooked ? @"已装" : @"失败") : @"关", c.adBlockOn ? (gAdBlockActive ? @"拦" : @"待注册") : @"关"];
+    self.statusLabel.text = [NSString stringWithFormat:@"定位：%@  时间：%@  替拍：%@\n天气：%@  反作弊：%@\n时钟：%@  广告：%@", Y(c.locOn), Y(c.timeOn), Y(c.photoOn), Y(c.wxOn), Y(c.antiOn), (c.clockScope == 0 ? @"关" : (c.clockScope == 1 ? (gClockHooked ? @"安全" : @"失败") : (gClockHooked ? @"全开" : @"失败"))), c.adBlockOn ? (gAdBlockActive ? @"拦" : @"待注册") : @"关"];
     NSString *img = c.imgPath.length ? c.imgPath : @"@latest"; if (img.length > 28) img = [img substringFromIndex:img.length - 28];
-    self.coordLabel.text = [NSString stringWithFormat:@"%.6f, %.6f  ·  %@", c.lat, c.lng, img];
+    CLLocationCoordinate2D g2 = MKGCJ02FromWGS84(c.lat, c.lng);
+    CLLocationCoordinate2D b2 = MKBD09FromWGS84(c.lat, c.lng);
+    self.coordLabel.text = [NSString stringWithFormat:@"WGS %.5f,%.5f  GCJ %.5f,%.5f  BD %.5f,%.5f  ·  %@",
+                            c.lat, c.lng, g2.latitude, g2.longitude, b2.latitude, b2.longitude, img];
 }
 - (void)switchChanged:(UISwitch *)sw {
     MKFakeCfg *c = CFG(); NSInteger idx = sw.tag - 7300; BOOL on = sw.on;
@@ -1492,13 +1706,52 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
         vc.modalPresentationStyle = UIModalPresentationFullScreen; [self presentViewController:vc animated:YES completion:nil]; return;
     }
     if (idx == 1) {
-        MKDatePickerSheet *vc = [MKDatePickerSheet new]; NSDateComponents *cc = [NSDateComponents new];
-        NSArray *p = [c.fakeTime componentsSeparatedByString:@" "], *d = [p.firstObject componentsSeparatedByString:@"-"], *t = [p.lastObject componentsSeparatedByString:@":"];
-        if (d.count == 3 && t.count >= 2) { cc.year = [d[0] integerValue]; cc.month = [d[1] integerValue]; cc.day = [d[2] integerValue]; cc.hour = [t[0] integerValue]; cc.minute = [t[1] integerValue]; cc.second = t.count > 2 ? [t[2] integerValue] : 0; vc.initialDate = [[NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian] dateFromComponents:cc]; }
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:@"设置拍摄时间"
+                             message:@"格式：yyyy-MM-dd HH:mm:ss（年份可随意改）"
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.text = c.fakeTime.length ? c.fakeTime : @"2026-10-01 12:00:00";
+            tf.placeholder = @"2026-10-01 12:00:00";
+            tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+            tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+            tf.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightRegular];
+        }];
+        [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         __weak typeof(self) weakSelf = self;
-        vc.onDone = ^(NSDate *date) { c.fakeTime = MKFormatDateManual(date); c.timeOn = YES; [c save]; MKRefreshFakeDate(); [weakSelf refreshStatus]; MKSnack([NSString stringWithFormat:@"假时间 %@", c.fakeTime]); };
-        vc.modalPresentationStyle = UIModalPresentationOverFullScreen; vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve; [self presentViewController:vc animated:YES completion:nil]; return;
+        [ac addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+            NSString *txt = [ac.textFields.firstObject.text
+                                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (!txt.length) return;
+
+            // 手动解析，不走 NSDateFormatter（它已被我们 hook）
+            int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
+            if (sscanf(txt.UTF8String, "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) < 5) {
+                MKAlert(@"格式不对", @"要形如 2026-10-01 12:00:00（年月日 空格 时分秒）");
+                return;
+            }
+            if (Y < 1970 || Y > 2099 || M < 1 || M > 12 || D < 1 || D > 31) {
+                MKAlert(@"日期越界", [NSString stringWithFormat:@"年=%d 月=%d 日=%d", Y, M, D]);
+                return;
+            }
+            if (h < 0 || h > 23 || m < 0 || m > 59 || sec < 0 || sec > 59) {
+                MKAlert(@"时间越界", [NSString stringWithFormat:@"%d:%d:%d", h, m, sec]);
+                return;
+            }
+
+            c.fakeTime = [NSString stringWithFormat:@"%04d-%02d-%02d %02d:%02d:%02d", Y, M, D, h, m, sec];
+            c.timeOn = YES;
+            [c save];
+            MKRefreshFakeDate();          // 内部会同步 C 层时钟偏移
+            [weakSelf refreshStatus];
+            MKLog(@"假时间已设为 %@", c.fakeTime);
+            MKSnack([NSString stringWithFormat:@"假时间 %@", c.fakeTime]);
+        }]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
     }
+
     if (idx == 2) {
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"修改天气" message:@"格式：天气,温度   例：多云,18" preferredStyle:UIAlertControllerStyleAlert];
         [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.text = [NSString stringWithFormat:@"%@,%lld", c.wxText, c.wxTemp]; }];
@@ -1515,12 +1768,56 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
         PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:conf]; pk.delegate = self;
         [self presentViewController:pk animated:YES completion:nil]; return;
     }
-    if (idx == 4) {
+    if (idx == 4) {                       // 底层时钟：安全模式选择
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:@"底层时钟（有水印时间才需要开）"
+                             message:@"改的是 C 层 time()/clock_gettime()。范围越大越准，也越容易崩。"
+                      preferredStyle:UIAlertControllerStyleActionSheet];
+        __weak typeof(self) weakSelf = self;
+
+        [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+            MKSetClockScope(0); [weakSelf refreshStatus]; MKSnack(@"底层时钟已关");
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"安全模式（只改 GPUMarkSDK，推荐）"
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            MKSetClockScope(1); [weakSelf refreshStatus]; MKSnack(@"安全模式：只改 GPUMarkSDK");
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"全开（白名单全改，可能闪退）"
+                                               style:UIAlertActionStyleDestructive
+                                             handler:^(UIAlertAction *a) {
+            MKSetClockScope(2); [weakSelf refreshStatus]; MKSnack(@"已全开，注意观察是否闪退");
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+        if (ac.popoverPresentationController) {
+            ac.popoverPresentationController.sourceView = b;
+            ac.popoverPresentationController.sourceRect = b.bounds;
+        }
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+
+    if (idx == 5) {                       // 去广告
+        c.adBlockOn = YES; [c save];
+        MKInstallDeferredHooks();
+        MKInstallAdBlock();
+        [self refreshStatus];
+        MKSnack(gAdBlockActive ? @"去广告已启用" : @"去广告注册失败，重启再试");
+        return;
+    }
+
+    if (idx == 6) {                       // 全部关闭
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"全部关闭" message:@"所有篡改暂停，hook 保留并直通原实现" preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         __weak typeof(self) weakSelf = self;
         [ac addAction:[UIAlertAction actionWithTitle:@"确认关闭" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-            c.locOn = NO; c.timeOn = NO; c.wxOn = NO; c.photoOn = NO; c.photoAlways = NO; c.photoUntil = 0; c.antiOn = NO; [c save]; MKRefreshFakeDate(); [weakSelf refreshStatus]; MKSnack(@"已全部关闭");
+            c.locOn = NO; c.timeOn = NO; c.wxOn = NO;
+            c.photoOn = NO; c.photoAlways = NO; c.photoUntil = 0;
+            c.antiOn = NO; c.safeClockOn = NO; c.clockScope = 0;
+            MKRevertClockHook();
+            [c save]; MKRefreshFakeDate(); [weakSelf refreshStatus]; MKSnack(@"已全部关闭");
         }]]; [self presentViewController:ac animated:YES completion:nil]; return;
     }
 }
@@ -1758,8 +2055,12 @@ static void MKSafeInstall(void (*fn)(void), const char *name) { @try { fn(); } @
 
 static void MKInstallAllHooks(void) {
     MKLog(@"========== MarkiFake 启动 ==========");
-    MKSafeInstall(MKInstallLocationHooks, "定位"); MKSafeInstall(MKInstallAntiCheatHooks, "反作弊");
-    MKSafeInstall(MKInstallCameraHooks, "相机"); MKSafeInstall(MKInstallWeatherHooks, "天气");
+    MKSafeInstall(MKInstallLocationHooks, "定位");
+    MKSafeInstall(MKInstallAntiCheatHooks, "反作弊");
+    MKSafeInstall(MKInstallCameraHooks,   "相机");
+    MKSafeInstall(MKInstallWeatherHooks,  "天气");
+    MKSafeInstall(MKInstallVerifyHooks,   "验真对齐");
+    MKSafeInstall(MKInstallDatumHooks,    "坐标系对齐");
 }
 
 static void MKInstallDeferredHooks(void) {
@@ -1774,7 +2075,7 @@ static void MKSchedulePanel(void) {
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         if (o_vsInit == NULL) MKInstallCameraHooks();
         if (o_gmUpdateItem == NULL) MKInstallWeatherHooks();
-        { static BOOL vDone = NO; if (!vDone) { vDone = YES; MKSafeInstall(MKInstallVerifyHooks, "验真对齐(前台)"); } }
+        { static BOOL vDone = NO; if (!vDone) { vDone = YES; MKSafeInstall(MKInstallVerifyHooks, "验真对齐(前台)"); MKSafeInstall(MKInstallDatumHooks, "坐标系对齐(前台)"); } }
         MKInstallDeferredHooks();
         // 每次进前台都补一次悬浮球（MKInstallFAB 内部用 gFABWindow 做幂等），
         // 万一第一次没拿到 windowScene 也不会永远没有球
