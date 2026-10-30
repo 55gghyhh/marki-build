@@ -14,6 +14,7 @@
 #import <MapKit/MapKit.h>
 #import <PhotosUI/PhotosUI.h>
 #include <dlfcn.h>
+#include <string.h>
 #include <time.h>
 #include <sys/time.h>
 #include <mach-o/dyld.h>
@@ -489,11 +490,36 @@ typedef struct { void **slot; void *orig; } MKRebind;
 static MKRebind gRebinds[MK_MAX_REBINDS];
 static int      gRebindCount = 0;
 
-static void MKMakeWritable(void *addr, size_t len) {
-    if (!addr || !len) return;
+// 返回 NO = 这块内存受保护、改不了。调用方必须跳过 —— 上一版忽略了 vm_protect 的
+// 返回值，在系统库/共享缓存页上照样往下写，直接触发内存保护崩溃。
+static BOOL MKMakeWritable(void *addr, size_t len) {
+    if (!addr || !len) return NO;
     uintptr_t page = (uintptr_t)addr & ~(uintptr_t)(getpagesize() - 1);
     uintptr_t end  = (uintptr_t)addr + len;
-    vm_protect(mach_task_self(), page, end - page, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    kern_return_t kr = vm_protect(mach_task_self(), page, end - page, false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        MKLog(@"✗ vm_protect 失败 kr=0x%x page=%p len=%zu → 跳过", kr, (void *)page, (size_t)(end - page));
+        return NO;
+    }
+    return YES;
+}
+
+// ---- 模块白名单：只允许动这三个，系统库一个字节都不碰 ----
+static BOOL MKImageAllowed(const char *path) {
+    if (!path) return NO;
+    // 硬拒绝：系统库、系统框架、dyld 共享缓存、开发者目录
+    if (strncmp(path, "/usr/lib/", 9) == 0)          return NO;
+    if (strncmp(path, "/System/Library/", 16) == 0)  return NO;
+    if (strncmp(path, "/System/", 8) == 0)           return NO;
+    if (strncmp(path, "/Developer/", 11) == 0)       return NO;
+    if (strstr(path, "/usr/lib/dyld"))               return NO;
+    if (strstr(path, "libsystem_"))                  return NO;
+    // 白名单（子串匹配，兼容 .app/Frameworks/xxx.framework/xxx 这种路径）
+    if (strstr(path, "marki_cn"))      return YES;
+    if (strstr(path, "GLCameraSDK"))   return YES;
+    if (strstr(path, "GPUMarkSDK"))    return YES;
+    return NO;
 }
 
 static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide) {
@@ -554,7 +580,7 @@ static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide) {
                         if (slots[k] == table[t].rep) break;
                         if (gRebindCount >= MK_MAX_REBINDS) break;
                         if (*(table[t].origSlot) == NULL) continue;
-                        MKMakeWritable(&slots[k], sizeof(void *));
+                        if (!MKMakeWritable(&slots[k], sizeof(void *))) break;
                         gRebinds[gRebindCount].slot = &slots[k];
                         gRebinds[gRebindCount].orig = slots[k];
                         gRebindCount++;
@@ -583,15 +609,22 @@ static BOOL MKApplyClockHook(void) {
     }
     gRebindCount = 0;
     int total = 0;
+    int scanned = 0;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!MKImageAllowed(path)) continue;          // ← 关键：系统库一律跳过
         const struct mach_header *h = _dyld_get_image_header(i);
         if (!h) continue;
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        total += MKRebindOneImage((const struct mach_header_64 *)h, slide);
+        int got = MKRebindOneImage((const struct mach_header_64 *)h, slide);
+        MKLog(@"时钟：允许的模块 %s → 改写 %d 个槽位", path, got);
+        scanned++;
+        total += got;
     }
     gClockHooked = (total > 0);
-    MKLog(@"时钟 fishhook: 扫描 %u 个镜像，改写 %d 个符号槽位（%s）", n, total, gClockHooked ? "成功" : "未命中，可能需要回退静态 interpose");
+    MKLog(@"时钟 fishhook: 共 %u 个镜像，白名单命中 %d 个，改写 %d 个符号槽位（%s）",
+          n, scanned, total, gClockHooked ? "成功" : "未命中");
     return gClockHooked;
 }
 
@@ -729,7 +762,22 @@ static UIColor *MKC_BLUE(void) { return MKC_RGB(10, 132, 255); }
 static UIColor *MKC_PURPLE(void) { return MKC_RGB(191, 90, 242); }
 static UIColor *MKC_TEAL(void) { return MKC_RGB(48, 176, 199); }
 
-static UIWindow *gFABWindow = nil; static BOOL gPanelShown = NO; static BOOL gPanelOnScreen = NO;
+static UIWindow *gFABWindow = nil; static BOOL gPanelShown = NO;
+
+// 用「弱引用 + UIKit 真实状态」代替布尔锁：面板被任何方式收掉（点背景、点 ✕、被系统
+// 收起、present 失败）都不会把锁卡死。上一版 gPanelOnScreen 一旦停在 YES 就永远弹不出来。
+// 这里故意声明成 UIViewController*：MKPanelViewController 在后面才定义，
+// 提前 @class 的话编译器看不到 presentingViewController / isBeingDismissed。
+static __weak UIViewController *gPanelVC = nil;
+static BOOL gPanelPresenting = NO;
+
+static BOOL MKPanelAlive(void) {
+    UIViewController *vc = gPanelVC;
+    if (!vc) return NO;
+    if (vc.isBeingDismissed) return NO;
+    return (vc.presentingViewController != nil);
+}
+static void MKPanelUnlock(void) { gPanelPresenting = NO; gPanelVC = nil; }
 
 static UIViewController *MKTopVC(void) {
     UIWindow *key = nil;
@@ -1066,7 +1114,21 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
     }
 }
 - (void)logTap { MKLogViewController *vc = [MKLogViewController new]; vc.modalPresentationStyle = UIModalPresentationFullScreen; [self presentViewController:vc animated:YES completion:nil]; }
-- (void)closeTap { [self dismissViewControllerAnimated:YES completion:^{ gPanelOnScreen = NO; }]; }
+- (void)closeTap {
+    MKLog(@"面板关闭");
+    gPanelPresenting = NO;
+    if (self.presentingViewController) {
+        [self dismissViewControllerAnimated:YES completion:^{ MKPanelUnlock(); }];
+    } else {
+        MKPanelUnlock();          // 根本没挂上，直接解锁
+    }
+}
+
+// 任何路径的消失都会走这里（包括被系统/其他 VC 收掉），兜底解锁
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (!self.isBeingPresented && self.presentingViewController == nil) MKPanelUnlock();
+}
 
 // 把相册选图代理方法放在主类的 @end 里面（已修复分类报错）
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
@@ -1092,15 +1154,41 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
 
 static void MKShowPanel(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (gPanelOnScreen) return;
-        UIViewController *top = MKTopVC(); if (!top) return;
-        if ([top isKindOfClass:[UIAlertController class]]) return;
-        MKPanelViewController *vc = [MKPanelViewController new]; gPanelOnScreen = YES;
+        // ① 真的已经在屏幕上 → 什么都不做（不是靠布尔锁猜）
+        if (MKPanelAlive()) { MKLog(@"面板已在屏幕上，忽略重复弹出"); return; }
+        // ② 正在 present 的瞬间重复点击 → 忽略
+        if (gPanelPresenting) { MKLog(@"面板正在 present，忽略"); return; }
+
+        // ③ 走到这里说明锁是残留的（上次没走 closeTap），先清掉再继续
+        MKPanelUnlock();
+
+        UIViewController *top = MKTopVC();
+        if (!top) { MKLog(@"没有顶层 VC，无法弹面板"); return; }
+        if (top.presentedViewController) {
+            MKLog(@"已有其它弹窗在显示：%@", NSStringFromClass([top.presentedViewController class]));
+            return;
+        }
+
+        MKPanelViewController *vc = [MKPanelViewController new];
+        gPanelVC = vc;
+        gPanelPresenting = YES;
+
         [top presentViewController:vc animated:YES completion:^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (vc.presentingViewController == nil && gPanelOnScreen) gPanelOnScreen = NO;
-            });
+            gPanelPresenting = NO;
+            BOOL ok = (vc.presentingViewController != nil);
+            MKLog(@"面板 present 完成 alive=%d", ok);
+            if (!ok) MKPanelUnlock();      // present 失败立刻解锁
         }];
+
+        // ④ 兜底看门狗：completion 因为动画被打断而没跑时，也要解锁
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            gPanelPresenting = NO;
+            if (!MKPanelAlive()) {
+                MKLog(@"面板未挂上，看门狗解锁");
+                MKPanelUnlock();
+            }
+        });
     });
 }
 
@@ -1132,11 +1220,96 @@ static void h_setProtocolClasses(id self, SEL _cmd, NSArray *classes) {
     ((void (*)(id, SEL, id))o_setProtocolClasses)(self, _cmd, arr);
 }
 
+// ============================================================================
+//  NSURLSession 层兜底拦截
+//  NSURLProtocol 只能拦「默认配置 + 走 protocolClasses 链路」的请求，很多大厂 SDK
+//  直接用自己的 session / CFNetwork，所以再在 dataTask 入口换 URL：
+//  换成一个必定 connection refused 的地址（127.0.0.1:1），立刻拿到
+//  NSURLErrorCannotConnectToHost(-1004)，不产生任何流量，也不会 hang。
+//  换 URL 而不是返回 nil/dummy task，调用方拿到的是正常的 task 对象，不会崩。
+// ============================================================================
+
+static NSURL *MKBlockedURL(void) {
+    static NSURL *u = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ u = [NSURL URLWithString:@"http://127.0.0.1:1/__mk_adblocked__"]; });
+    return u;
+}
+
+static BOOL MKIsAdURL(NSURL *url) {
+    if (!url || !gAdBlockActive) return NO;
+    NSString *s = url.absoluteString.lowercaseString;
+    if (!s.length) return NO;
+    if ([s containsString:@"__mk_adblocked__"]) return NO;   // 自己造的地址，别再拦
+    for (NSString *k in [MKAdBlockProtocol mk_adKeywords]) {
+        if ([s containsString:k]) return YES;
+    }
+    return NO;
+}
+
+static NSURLRequest *MKNeutralize(NSURLRequest *req) {
+    if (![req isKindOfClass:[NSURLRequest class]]) return req;
+    if (!MKIsAdURL(req.URL)) return req;
+    NSMutableURLRequest *m = [req mutableCopy];
+    m.URL = MKBlockedURL();
+    MKLog(@"广告请求换向: %@%@", req.URL.host, req.URL.path);
+    return m;
+}
+
+static IMP o_dtReqCb = NULL, o_dtReq = NULL, o_dtUrlCb = NULL, o_dtUrl = NULL, o_syncReq = NULL;
+
+static id h_dtReqCb(id self, SEL _cmd, NSURLRequest *req, id cb) {
+    return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, MKNeutralize(req), cb);
+}
+static id h_dtReq(id self, SEL _cmd, NSURLRequest *req) {
+    return ((id (*)(id, SEL, id))o_dtReq)(self, _cmd, MKNeutralize(req));
+}
+static id h_dtUrlCb(id self, SEL _cmd, NSURL *url, id cb) {
+    return ((id (*)(id, SEL, id, id))o_dtUrlCb)(self, _cmd, MKIsAdURL(url) ? MKBlockedURL() : url, cb);
+}
+static id h_dtUrl(id self, SEL _cmd, NSURL *url) {
+    return ((id (*)(id, SEL, id))o_dtUrl)(self, _cmd, MKIsAdURL(url) ? MKBlockedURL() : url);
+}
+
+// 老 SDK 用的同步接口，直接返回 nil + error
+static NSData *h_syncReq(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **resp, NSError **err) {
+    if (MKIsAdURL(req.URL)) {
+        MKLog(@"广告同步请求已拦截: %@", req.URL.host);
+        if (resp) *resp = nil;
+        if (err)  *err = [NSError errorWithDomain:NSURLErrorDomain
+                                             code:NSURLErrorCancelled
+                                         userInfo:@{ NSLocalizedDescriptionKey : @"blocked by MarkiFake" }];
+        return nil;
+    }
+    return ((NSData *(*)(id, SEL, id, NSURLResponse **, NSError **))o_syncReq)(self, _cmd, req, resp, err);
+}
+
 static void MKInstallAdBlock(void) {
     static BOOL done = NO; if (done) return;
     if (!CFG().adBlockOn) return;
-    [NSURLProtocol registerClass:[MKAdBlockProtocol class]]; gAdBlockActive = YES; done = YES;
-    o_setProtocolClasses = MKHook(objc_getClass("NSURLSessionConfiguration"), MKSEL(setProtocolClasses:), (IMP)h_setProtocolClasses, "AdBlock");
+
+    // ① 原来的 NSURLProtocol（保留）
+    [NSURLProtocol registerClass:[MKAdBlockProtocol class]];
+    gAdBlockActive = YES;
+    done = YES;
+
+    // ② 强制把拦截器插到 protocolClasses 第 0 位（压过 SDK 自己设的）
+    o_setProtocolClasses = MKHook(objc_getClass("NSURLSessionConfiguration"), MKSEL(setProtocolClasses:), (IMP)h_setProtocolClasses, "AdBlock_SetProtocols");
+
+    // ③ NSURLSession dataTask 入口
+    Class sess = objc_getClass("NSURLSession");
+    o_dtReqCb = MKHook(sess, @selector(dataTaskWithRequest:completionHandler:), (IMP)h_dtReqCb, "AdBlock_DataTaskReqCb");
+    o_dtReq   = MKHook(sess, @selector(dataTaskWithRequest:),                    (IMP)h_dtReq,   "AdBlock_DataTaskReq");
+    o_dtUrlCb = MKHook(sess, @selector(dataTaskWithURL:completionHandler:),      (IMP)h_dtUrlCb, "AdBlock_DataTaskUrlCb");
+    o_dtUrl   = MKHook(sess, @selector(dataTaskWithURL:),                        (IMP)h_dtUrl,   "AdBlock_DataTaskUrl");
+
+    // ④ NSURLConnection 同步接口
+    o_syncReq = MKHookClass(objc_getClass("NSURLConnection"),
+                            @selector(sendSynchronousRequest:returningResponse:error:),
+                            (IMP)h_syncReq, "+[NSURLConnection sendSynchronousRequest:...]");
+
+    MKLog(@"去广告已装：Protocol + 4 个 dataTask 入口 + 同步请求，关键字 %lu 条",
+          (unsigned long)[MKAdBlockProtocol mk_adKeywords].count);
 }
 
 static void MKSafeInstall(void (*fn)(void), const char *name) { @try { fn(); } @catch (NSException *e) { MKLog(@"✗ 安装器 %s 抛异常: %@", name, e.reason); } @catch (id other) {} }
@@ -1159,9 +1332,15 @@ static void MKSchedulePanel(void) {
         if (o_vsInit == NULL) MKInstallCameraHooks();
         if (o_gmUpdateItem == NULL) MKInstallWeatherHooks();
         MKInstallDeferredHooks();
+        // 每次进前台都补一次悬浮球（MKInstallFAB 内部用 gFABWindow 做幂等），
+        // 万一第一次没拿到 windowScene 也不会永远没有球
+        MKInstallFAB();
         if (gPanelShown) return; gPanelShown = YES;
+        // 不再自动弹面板：面板只由用户点悬浮球触发
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            MKInstallFAB(); MKShowPanel(); if (CFG().photoOn) MKPrefetchSwapImage();
+            MKInstallFAB();
+            if (CFG().photoOn) MKPrefetchSwapImage();
+            MKLog(@"悬浮球就绪，点它打开面板");
         });
     }];
 }
