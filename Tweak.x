@@ -15,6 +15,7 @@
 #import <PhotosUI/PhotosUI.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <zlib.h>          // gzip 解压：地理接口响应可能被压缩
 #include <time.h>
 #include <sys/time.h>
 #include <mach-o/dyld.h>
@@ -473,18 +474,77 @@ static id h_locSource(id self, SEL _cmd) { if (CFG().antiOn && CFG().locOn) retu
 static void MKHookDoubleGetter(Class cls, SEL sel, IMP fn, IMP *slot, const char *label) {
     if (!cls) return; Method m = class_getInstanceMethod(cls, sel); if (!m) return; if (MKRetType(m) != 'd') return; *slot = MKHook(cls, sel, fn, label);
 }
+
+// 字符串 getter（地址兜底用）：返回类型必须是 '@'
+static void MKHookStringGetter(Class cls, SEL sel, IMP fn, IMP *slot, const char *label) {
+    if (!cls) { MKLog(@"- %s: class nil", label); return; }
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { MKLog(@"- %s: no method", label); return; }
+    if (MKRetType(m) != '@') { MKLog(@"- %s: return type %c != @", label, MKRetType(m)); return; }
+    *slot = MKHook(cls, sel, fn, label);
+}
+
+static IMP o_infoAddr = NULL, o_objAddr = NULL, o_objNowAddr = NULL;
+
+static id h_infoAddr(id self, SEL _cmd) {
+    if (CFG().locOn && CFG().addr.length) return CFG().addr;
+    return o_infoAddr ? ((id (*)(id, SEL))o_infoAddr)(self, _cmd) : nil;
+}
+static id h_objAddr(id self, SEL _cmd) {
+    if (CFG().locOn && CFG().addr.length) return CFG().addr;
+    return o_objAddr ? ((id (*)(id, SEL))o_objAddr)(self, _cmd) : nil;
+}
+static id h_objNowAddr(id self, SEL _cmd) {
+    if (CFG().locOn && CFG().addr.length) return CFG().addr;
+    return o_objNowAddr ? ((id (*)(id, SEL))o_objNowAddr)(self, _cmd) : nil;
+}
+
+// 探针：把类的实例方法全打出来，确认这个 build 里到底叫什么
+static void MKDumpClassMethods(Class cls, const char *tag) {
+    if (!cls) { MKLog(@"DUMP %s: class nil", tag); return; }
+    unsigned int cnt = 0;
+    Method *ms = class_copyMethodList(cls, &cnt);
+    MKLog(@"DUMP %s <%s> : %u methods", tag, class_getName(cls), cnt);
+    for (unsigned int i = 0; i < cnt; i++) {
+        MKLog(@"   -%s   %s", sel_getName(method_getName(ms[i])), method_getTypeEncoding(ms[i]));
+    }
+    free(ms);
+
+    Class sup = class_getSuperclass(cls);
+    if (sup && sup != objc_getClass("NSObject")) {
+        unsigned int sc = 0;
+        Method *sm = class_copyMethodList(sup, &sc);
+        MKLog(@"DUMP %s super <%s> : %u methods", tag, class_getName(sup), sc);
+        for (unsigned int i = 0; i < sc && i < 40; i++) {
+            MKLog(@"   -%s   %s", sel_getName(method_getName(sm[i])), method_getTypeEncoding(sm[i]));
+        }
+        free(sm);
+    }
+}
 static void MKInstallLocationHooks(void) {
     Class mgr = objc_getClass("MKLocationManager");
+
+    // 探针：先把这个类的方法全打出来（这个 build 里 getRecentLocation/setRecentLocation: 都没了）
+    MKDumpClassMethods(mgr, "MKLocationManager");
+
     if (mgr) {
         o_mgrGetRecent = MKHook(mgr, MKSEL(getRecentLocation), (IMP)h_mgrGetRecent, "Location_Get");
         o_mgrSetRecent = MKHook(mgr, MKSEL(setRecentLocation:), (IMP)h_mgrSetRecent, "Location_Set");
         o_mgrCheckAuth = MKHook(mgr, MKSEL(checkLocationAuthorization), (IMP)h_mgrCheckAuth, "Location_Auth");
     }
-    MKHookDoubleGetter(objc_getClass("MKLocationInfo"), MKSEL(latitude), (IMP)h_infoLat, &o_infoLat, "Loc_Info_Lat");
-    MKHookDoubleGetter(objc_getClass("MKLocationInfo"), MKSEL(longitude), (IMP)h_infoLng, &o_infoLng, "Loc_Info_Lng");
+
+    Class info = objc_getClass("MKLocationInfo");
+    MKDumpClassMethods(info, "MKLocationInfo");
+    MKHookDoubleGetter(info, MKSEL(latitude), (IMP)h_infoLat, &o_infoLat, "Loc_Info_Lat");
+    MKHookDoubleGetter(info, MKSEL(longitude), (IMP)h_infoLng, &o_infoLng, "Loc_Info_Lng");
+    MKHookStringGetter(info, MKSEL(address), (IMP)h_infoAddr, &o_infoAddr, "Loc_Info_Addr");
+
     Class obj = objc_getClass("_TtC8marki_cn16MKLocationObject");
+    MKDumpClassMethods(obj, "MKLocationObject");
     MKHookDoubleGetter(obj, MKSEL(latitude), (IMP)h_objLat, &o_objLat, "Loc_Obj_Lat");
     MKHookDoubleGetter(obj, MKSEL(longitude), (IMP)h_objLng, &o_objLng, "Loc_Obj_Lng");
+    MKHookStringGetter(obj, MKSEL(address), (IMP)h_objAddr, &o_objAddr, "Loc_Obj_Addr");
+    MKHookStringGetter(obj, MKSEL(nowAllAddress), (IMP)h_objNowAddr, &o_objNowAddr, "Loc_Obj_NowAddr");
     o_locMgrLocation = MKHook(objc_getClass("CLLocationManager"), @selector(location), (IMP)h_locMgrLocation, "Loc_Mgr_Loc");
     o_locCoord = MKHook(objc_getClass("CLLocation"), @selector(coordinate), (IMP)h_locCoord, "Loc_Coord");
     o_locSource = MKHook(objc_getClass("CLLocation"), @selector(sourceInformation), (IMP)h_locSource, "Loc_Source");
@@ -572,6 +632,10 @@ static BOOL MKMakeWritable(void *addr, size_t len) {
 
 // ---- 作用域：0=关  1=只动 GPUMarkSDK（安全，推荐）  2=白名单全开（激进） ----
 static int  gClockScope = 1;
+// EXIF 专用：安装期间强制放行 marki_cn（不受 clockScope 限制）
+static BOOL gBypassScope = NO;
+// 当前正在处理的镜像是否允许改 __la_symbol_ptr
+static BOOL gCurImageLazyOK = NO;
 static BOOL gAllowLazyPtr = NO;        // 是否允许改 __la_symbol_ptr（默认禁止）
 
 // 二次硬拒名单：这些块即使路径里含白名单关键字也一律跳过。
@@ -605,6 +669,11 @@ static BOOL MKImageAllowed(const char *path) {
 
     // 二次拒绝
     if (MKImageBlacklisted(path)) return NO;
+
+    // EXIF 专用旁路：CGImageSourceCopyPropertiesAtIndex 的槽位在 marki_cn 里，
+    // 如果跟着 clockScope 走，scope=1 时 EXIF 注入会被一起杀掉（实测 0 命中）。
+    // 只放行主二进制，其余仍按 scope 判定。
+    if (gBypassScope && strstr(path, "marki_cn")) return YES;
 
     // scope 1：只碰水印渲染器。GLCameraSDK 有 60fps 渲染线程，marki_cn 里有全部广告 SDK，
     // 两边都不该被改 —— 这是上一版 56 个槽位之后 10 秒闪退的直接原因。
@@ -678,7 +747,7 @@ static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide,
                 // ③ __la_symbol_ptr 默认完全禁止：
                 //    惰性绑定槽位在首次调用前指向 dyld_stub_binder 跳板，
                 //    改写它等于欺骗 dyld 的绑定流程，是 10 秒后随机崩溃的头号来源。
-                if (isLazy && !gAllowLazyPtr) continue;
+                if (isLazy && !gCurImageLazyOK) continue;
                 if (!isGot && !isLazy) continue;
 
                 // ④ 范围校验：section 必须完整落在本段文件映射内
@@ -741,24 +810,43 @@ static int MKRebindOneImage(const struct mach_header_64 *hdr, intptr_t slide,
 }
 
 // 通用：在所有白名单镜像里改写 tab 里列出的符号
-static int MKRebindAllImages(MKHookEntry *tab, int tabCount, const char *tag) {
+//   lazyOK      : YES = 允许改 __la_symbol_ptr（EXIF 需要，时钟只有 GPUMarkSDK 需要）
+//   bypassScope : YES = 无视 clockScope 强制放行 marki_cn（EXIF 专用）
+static int MKRebindAllImages(MKHookEntry *tab, int tabCount, const char *tag,
+                             BOOL lazyOK, BOOL bypassScope) {
     int total = 0, scanned = 0;
     uint32_t n = _dyld_image_count();
+
+    BOOL oldBypass = gBypassScope;
+    gBypassScope = bypassScope;
+
     for (uint32_t i = 0; i < n; i++) {
         const char *path = _dyld_get_image_name(i);
         if (!MKImageAllowed(path)) continue;          // 系统库一律跳过
         const struct mach_header *h = _dyld_get_image_header(i);
         if (!h) continue;
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        // 每镜像单独决定能否碰 __la_symbol_ptr：
+        //   EXIF 那边一律允许；时钟那边 scope=2 全放开，scope=1 只放开 GPUMarkSDK
+        //   （实测 GPUMarkSDK 的 _time 就在 __la_symbol_ptr，不放行等于没改）
+        gCurImageLazyOK = lazyOK
+                       || (gClockScope >= 2)
+                       || (gClockScope == 1 && strstr(path, "GPUMarkSDK") != NULL);
+
         int got = MKRebindOneImage((const struct mach_header_64 *)h, slide, tab, tabCount);
-        if (got) MKLog(@"%s：%s → 改写 %d 个槽位", tag ? tag : "rebind", path, got);
+        if (got) MKLog(@"%s: %s -> %d slots", tag ? tag : "rebind", path, got);
         scanned++;
         total += got;
     }
-    MKLog(@"%s fishhook: 共 %u 个镜像，白名单命中 %d 个，改写 %d 个槽位",
+
+    gBypassScope = oldBypass;
+    gCurImageLazyOK = NO;
+
+    MKLog(@"%s fishhook: %u images, %d allowed, %d slots rewritten",
           tag ? tag : "rebind", n, scanned, total);
     if (total > 12) {
-        MKLog(@"⚠ 槽位数 %d 偏多：如果是时钟，建议把 clockScope 改成 1（只动 GPUMarkSDK）", total);
+        MKLog(@"WARN: %d slots is a lot, consider clockScope=1 (GPUMarkSDK only)", total);
     }
     return total;
 }
@@ -769,8 +857,8 @@ static BOOL MKApplyClockHook(void) {
     // 每次安装前从配置刷新作用域
     gClockScope   = (int)CFG().clockScope;
     gAllowLazyPtr = (gClockScope >= 2);
-    MKLog(@"时钟 fishhook: scope=%d（1=只 GPUMarkSDK 安全 / 2=白名单全开） lazy=%d",
-          gClockScope, (int)gAllowLazyPtr);
+    MKLog(@"CLOCK fishhook: scope=%d (1=GPUMarkSDK only, 2=all whitelisted) lazyInGPUMark=YES",
+          gClockScope);
 
     if (!gOrigTime || !gOrigGettimeofday || !gOrigClockGettime) {
         gOrigTime          = (time_t (*)(time_t *))dlsym(RTLD_DEFAULT, "time");
@@ -786,7 +874,7 @@ static BOOL MKApplyClockHook(void) {
         { "_gettimeofday",  (void *)MK_gettimeofday,  (void **)&gOrigGettimeofday,  MK_GROUP_CLOCK },
         { "_clock_gettime", (void *)MK_clock_gettime, (void **)&gOrigClockGettime,  MK_GROUP_CLOCK },
     };
-    int total = MKRebindAllImages(tab, 3, "时钟");
+    int total = MKRebindAllImages(tab, 3, "CLOCK", NO, NO);
     gClockHooked = (total > 0);
     return gClockHooked;
 }
@@ -864,7 +952,7 @@ static void MKSetClockScope(int scope) {
     BOOL ok = MKApplyClockHook();
     [c save];
     MKRecomputeTimeDelta();
-    MKLog(@"底层时钟：scope=%d 安装%s", scope, ok ? "成功" : "失败（未命中槽位）");
+    MKLog(@"底层时钟：scope=%d 安装%s", scope, ok ? "OK" : "FAIL(no slot)");
     if (!ok) {
         MKAlert(@"时钟 Hook 未命中",
                 scope == 1
@@ -1247,7 +1335,7 @@ static void MKInstallVerifyHooks(void) {
                   (void *)mk_CGImageSourceCopyPropertiesAtIndex,
                   (void **)&gOrigCGISProps, MK_GROUP_EXIF },
             };
-            MKRebindAllImages(tab, 1, "EXIF");
+            MKRebindAllImages(tab, 1, "EXIF", YES, YES);   // 强制放行 marki_cn + 允许 lazy
         } else {
             MKLog(@"✗ 拿不到 CGImageSourceCopyPropertiesAtIndex 真身，EXIF 注入不可用");
         }
@@ -1986,9 +2074,205 @@ static void MKLogNetReq(NSString *urlStr) {
     MKLog(@"[NetReq] %@", s);
 }
 
+// ============================================================================
+//  地理接口响应改写（解决 sign 限制：参数不能动，只能改返回值）
+//
+//  App 请求：
+//    /wms/location/getPlaceSuggestion?...&location=<WGS>&mapType=baidu&...&sign=xxx
+//    /wms/location/getReversCoding?location=<..>&mapType=TENCENT&sign=xxx
+//  location 带 sign，改一个字符就验签失败 → 只能在 completionHandler 里替换返回体。
+// ============================================================================
+
+static BOOL MKIsGeoURL(NSURL *url) {
+    if (!url) return NO;
+    NSString *s = url.absoluteString;
+    if (!s.length) return NO;
+    if (![s containsString:@"markiapp.com"]) return NO;     // 只碰自家接口
+    return [s containsString:@"getPlaceSuggestion"]
+        || [s containsString:@"getReversCoding"]
+        || [s containsString:@"getReverseCoding"];
+}
+
+// gzip 解压（响应可能被 Content-Encoding: gzip 包过一层）
+static NSData *MKGunzip(NSData *data) {
+    if (data.length < 18) return nil;
+    const uint8_t *b = (const uint8_t *)data.bytes;
+    if (!(b[0] == 0x1f && b[1] == 0x8b)) return nil;       // 不是 gzip
+
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, 16 + MAX_WBITS) != Z_OK) return nil;
+
+    NSMutableData *out = [NSMutableData dataWithCapacity:data.length * 4];
+    zs.next_in  = (Bytef *)b;
+    zs.avail_in = (uInt)data.length;
+
+    uint8_t buf[16384];
+    int rc = Z_OK;
+    do {
+        zs.next_out  = buf;
+        zs.avail_out = sizeof(buf);
+        rc = inflate(&zs, Z_NO_FLUSH);
+        if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) break;
+        NSUInteger got = sizeof(buf) - zs.avail_out;
+        if (got) [out appendBytes:buf length:got];
+        if (out.length > 8 * 1024 * 1024) break;            // 安全阀
+    } while (rc != Z_STREAM_END && zs.avail_in > 0);
+
+    inflateEnd(&zs);
+    return out.length ? out : nil;
+}
+
+static NSSet *MKAddrKeys(void) {
+    static NSSet *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[
+            @"name", @"poiName", @"poi", @"address", @"addr", @"addressName",
+            @"formattedAddress", @"fullAddress", @"detailAddress", @"poiAddress",
+            @"locationName", @"locationAddress", @"districtName", @"cityName",
+            @"provinceName", @"townName", @"streetName", @"road",
+            @"suggestion", @"displayName",
+        ]];
+    });
+    return s;
+}
+
+static BOOL MKIsLatKey(NSString *k) {
+    NSString *l = k.lowercaseString;
+    return [l isEqualToString:@"latitude"] || [l isEqualToString:@"lat"]
+        || [l isEqualToString:@"pointlat"] || [l isEqualToString:@"bd09lat"]
+        || [l isEqualToString:@"gcjlat"];
+}
+static BOOL MKIsLngKey(NSString *k) {
+    NSString *l = k.lowercaseString;
+    return [l isEqualToString:@"longitude"] || [l isEqualToString:@"lng"]
+        || [l isEqualToString:@"lon"] || [l isEqualToString:@"pointlng"]
+        || [l isEqualToString:@"bd09lng"] || [l isEqualToString:@"gcjlng"];
+}
+
+// 递归改写。coordinate 用「和请求 mapType 同基准」的值，
+// 否则地图上的图钉会和我们给的地址对不上（虽然地址已经是我们写的）。
+static id MKRewriteGeoJSON(id obj, CLLocationCoordinate2D coord, int *hits) {
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:[(NSDictionary *)obj count]];
+        for (id key in (NSDictionary *)obj) {
+            if (![key isKindOfClass:[NSString class]]) { out[key] = MKRewriteGeoJSON([(NSDictionary *)obj objectForKey:key], coord, hits); continue; }
+            NSString *k = (NSString *)key;
+            id v = [(NSDictionary *)obj objectForKey:k];
+
+            if ([MKAddrKeys() containsObject:k] && CFG().addr.length) {
+                out[k] = CFG().addr;
+                (*hits)++;
+                continue;
+            }
+            if (MKIsLatKey(k)) {
+                out[k] = [v isKindOfClass:[NSString class]]
+                       ? [NSString stringWithFormat:@"%.8f", coord.latitude]
+                       : @(coord.latitude);
+                (*hits)++;
+                continue;
+            }
+            if (MKIsLngKey(k)) {
+                out[k] = [v isKindOfClass:[NSString class]]
+                       ? [NSString stringWithFormat:@"%.8f", coord.longitude]
+                       : @(coord.longitude);
+                (*hits)++;
+                continue;
+            }
+            out[k] = MKRewriteGeoJSON(v, coord, hits);
+        }
+        return out;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray arrayWithCapacity:[(NSArray *)obj count]];
+        for (id v in (NSArray *)obj) [out addObject:MKRewriteGeoJSON(v, coord, hits)];
+        return out;
+    }
+    return obj;
+}
+
+// 按 mapType 选基准：baidu=BD09，TENCENT/AMAP=GCJ02，其它=WGS
+static CLLocationCoordinate2D MKCoordForURL(NSURL *url, const char **datumName) {
+    NSString *s = url.absoluteString.uppercaseString;
+    if ([s containsString:@"MAPTYPE=BAIDU"]) { if (datumName) *datumName = "BD09";    return MKCoordBD09(); }
+    if ([s containsString:@"MAPTYPE=TENCENT"] ||
+        [s containsString:@"MAPTYPE=AMAP"])   { if (datumName) *datumName = "GCJ02";   return MKCoordGCJ02(); }
+    if (datumName) *datumName = "WGS84";
+    return MKCoordWGS84();
+}
+
+static NSData *MKRewriteGeoData(NSData *data, NSURL *url) {
+    if (!data.length) return data;
+    if (!CFG().locOn || !CFG().addr.length) return data;
+
+    NSData *plain = data;
+    const uint8_t *b = (const uint8_t *)data.bytes;
+    if (data.length > 2 && b[0] == 0x1f && b[1] == 0x8b) {
+        plain = MKGunzip(data);
+        if (!plain) { MKLog(@"[Geo] gzip inflate failed, pass through"); return data; }
+        MKLog(@"[Geo] gzip %lu -> %lu B", (unsigned long)data.length, (unsigned long)plain.length);
+    }
+
+    NSError *err = nil;
+    id json = [NSJSONSerialization JSONObjectWithData:plain options:0 error:&err];
+    if (!json) {
+        MKLog(@"[Geo] not JSON (%lu B): %@", (unsigned long)plain.length, err.localizedDescription);
+        return data;
+    }
+
+    // 原始返回体（截断），用来核对替换是否生效
+    NSString *raw = [[NSString alloc] initWithData:plain encoding:NSUTF8StringEncoding];
+    if (raw.length > 700) raw = [[raw substringToIndex:700] stringByAppendingString:@"...(truncated)"];
+    MKLog(@"[GeoRaw] %@", raw);
+
+    const char *datum = "WGS84";
+    CLLocationCoordinate2D c = MKCoordForURL(url, &datum);
+
+    int hits = 0;
+    id out = MKRewriteGeoJSON(json, c, &hits);
+    if (hits == 0) {
+        MKLog(@"[Geo] no field matched (addr=%@), pass through", CFG().addr);
+        return data;
+    }
+
+    NSData *nd = [NSJSONSerialization dataWithJSONObject:out options:0 error:&err];
+    if (!nd) { MKLog(@"[Geo] re-serialize failed: %@", err.localizedDescription); return data; }
+
+    NSString *after = [[NSString alloc] initWithData:nd encoding:NSUTF8StringEncoding];
+    if (after.length > 400) after = [[after substringToIndex:400] stringByAppendingString:@"..."];
+    MKLog(@"[Geo] rewrote %d fields -> addr=%@ coord=%.6f,%.6f(%s)", hits, CFG().addr, c.latitude, c.longitude, datum);
+    MKLog(@"[GeoNew] %@", after);
+    return nd;
+}
+
+typedef void (^MKDataCompletion)(NSData *, NSURLResponse *, NSError *);
+
+// 包一层 completionHandler：只对地理接口生效，其它原样透传
+static id MKWrapDataHandler(id handler, NSURL *url) {
+    if (!handler) return handler;
+    if (!MKIsGeoURL(url)) return handler;
+    if (!CFG().locOn) return handler;
+
+    MKDataCompletion orig = (MKDataCompletion)handler;
+    MKDataCompletion wrapped = ^(NSData *data, NSURLResponse *resp, NSError *e) {
+        NSData *out = data;
+        @try {
+            out = MKRewriteGeoData(data, url);
+        } @catch (NSException *ex) {
+            MKLog(@"[Geo] rewrite exception: %@", ex.reason);
+            out = data;
+        }
+        if (orig) orig(out, resp, e);
+    };
+    MKLog(@"[Geo] handler wrapped for %@", url.path);
+    return [wrapped copy];
+}
+
 static id h_dtReqCb(id self, SEL _cmd, NSURLRequest *req, id cb) {
     MKLogNetReq(req.URL.absoluteString);
-    return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, MKNeutralize(req), cb);
+    id wrapped = MKWrapDataHandler(cb, req.URL);
+    return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, MKNeutralize(req), wrapped);
 }
 static id h_dtReq(id self, SEL _cmd, NSURLRequest *req) {
     MKLogNetReq(req.URL.absoluteString);
@@ -1996,7 +2280,8 @@ static id h_dtReq(id self, SEL _cmd, NSURLRequest *req) {
 }
 static id h_dtUrlCb(id self, SEL _cmd, NSURL *url, id cb) {
     MKLogNetReq(url.absoluteString);
-    return ((id (*)(id, SEL, id, id))o_dtUrlCb)(self, _cmd, MKIsAdURL(url) ? MKBlockedURL() : url, cb);
+    id wrapped = MKWrapDataHandler(cb, url);
+    return ((id (*)(id, SEL, id, id))o_dtUrlCb)(self, _cmd, MKIsAdURL(url) ? MKBlockedURL() : url, wrapped);
 }
 static id h_dtUrl(id self, SEL _cmd, NSURL *url) {
     MKLogNetReq(url.absoluteString);
@@ -2033,7 +2318,7 @@ static void MKInstallAdBlock(void) {
         o_dtUrl   = MKHook(sess, @selector(dataTaskWithURL:),                        (IMP)h_dtUrl,   "Net_DataTaskUrl");
         o_syncReq = MKHookClass(objc_getClass("NSURLConnection"),
                                 @selector(sendSynchronousRequest:returningResponse:error:),
-                                (IMP)h_syncReq, "+[NSURLConnection sendSynchronousRequest:...]");
+                                (IMP)h_syncReq, "NSURLConnection_syncReq");
         MKLog(@"请求监控已装：4 个 dataTask 入口 + 同步请求（命中 map/location/verify/confirm 才打日志）");
     }
 
@@ -2055,19 +2340,19 @@ static void MKSafeInstall(void (*fn)(void), const char *name) { @try { fn(); } @
 
 static void MKInstallAllHooks(void) {
     MKLog(@"========== MarkiFake 启动 ==========");
-    MKSafeInstall(MKInstallLocationHooks, "定位");
-    MKSafeInstall(MKInstallAntiCheatHooks, "反作弊");
-    MKSafeInstall(MKInstallCameraHooks,   "相机");
-    MKSafeInstall(MKInstallWeatherHooks,  "天气");
-    MKSafeInstall(MKInstallVerifyHooks,   "验真对齐");
-    MKSafeInstall(MKInstallDatumHooks,    "坐标系对齐");
+    MKSafeInstall(MKInstallLocationHooks, "LOCATION");
+    MKSafeInstall(MKInstallAntiCheatHooks, "ANTICHEAT");
+    MKSafeInstall(MKInstallCameraHooks,   "CAMERA");
+    MKSafeInstall(MKInstallWeatherHooks,  "WEATHER");
+    MKSafeInstall(MKInstallVerifyHooks,   "VERIFY");
+    MKSafeInstall(MKInstallDatumHooks,    "DATUM");
 }
 
 static void MKInstallDeferredHooks(void) {
     static BOOL done = NO; if (done) return; done = YES;
-    MKSafeInstall(MKInstallTimeHooks, "时间(ObjC)");
+    MKSafeInstall(MKInstallTimeHooks, "TIME_OBJC");
     // 请求监控必须无条件装（广告拦截在函数内部自己判断开关）
-    MKSafeInstall(MKInstallAdBlock, "网络监控+去广告");
+    MKSafeInstall(MKInstallAdBlock, "NET_ADBLOCK");
     if (CFG().safeClockOn) { @try { MKSetSafeClock(YES); } @catch (NSException *e) {} }
 }
 
@@ -2075,7 +2360,7 @@ static void MKSchedulePanel(void) {
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         if (o_vsInit == NULL) MKInstallCameraHooks();
         if (o_gmUpdateItem == NULL) MKInstallWeatherHooks();
-        { static BOOL vDone = NO; if (!vDone) { vDone = YES; MKSafeInstall(MKInstallVerifyHooks, "验真对齐(前台)"); MKSafeInstall(MKInstallDatumHooks, "坐标系对齐(前台)"); } }
+        { static BOOL vDone = NO; if (!vDone) { vDone = YES; MKSafeInstall(MKInstallVerifyHooks, "VERIFY_FG"); MKSafeInstall(MKInstallDatumHooks, "DATUM_FG"); } }
         MKInstallDeferredHooks();
         // 每次进前台都补一次悬浮球（MKInstallFAB 内部用 gFABWindow 做幂等），
         // 万一第一次没拿到 windowScene 也不会永远没有球
