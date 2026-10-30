@@ -2074,19 +2074,14 @@ static NSData *MKRewriteGeoData(NSData *data, NSURL *url);
     return a;
 }
 
-+ (BOOL)isWatermarkURL:(NSURL *)url {
-    if (!url) return NO;
-    return ([url.absoluteString containsString:@"WaterMark/getNewWatermark"] ||
-            [url.absoluteString containsString:@"watermark/getNewWatermark"]);
-}
-
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     if (!request.URL) return NO;
     // 自循环保护：我们转发出去的请求带这个标记，直接放过
     if ([NSURLProtocol propertyForKey:@"MKHandled" inRequest:request]) return NO;
 
-    if ([self isWatermarkURL:request.URL]) return YES;      // 取证，永远拦
-    if (MKIsGeoURL(request.URL))          return YES;      // 地理接口改写
+    // getNewWatermark 不再走本协议：它必须原封不动地由 App 自己发出去。
+    // 上一版用新 session 转发 → 服务端返回 0 字节 → 防伪码没有服务端记录。
+    if (MKIsGeoURL(request.URL))          return YES;      // 地理接口改写（明文 JSON，安全）
     if (gAdBlockActive && [NSURLProtocol propertyForKey:@"MKAdBlocked" inRequest:request] == nil) {
         NSString *s = request.URL.absoluteString.lowercaseString;
         for (NSString *k in [self mk_adKeywords]) if ([s containsString:k]) return YES;
@@ -2097,19 +2092,55 @@ static NSData *MKRewriteGeoData(NSData *data, NSURL *url);
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 + (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b { return NO; }
 
-// 共享的转发 session（不挂任何自定义 protocol，天然不循环）
+// 抓一份 App 自己用的 NSURLSessionConfiguration（在 session 创建时记录），
+// 转发时用它 + 去掉我们的 protocol。这样 HTTPAdditionalHeaders / Cookie /
+// 超时 / TLS 最低版本全部和 App 一致，不会再出「服务端返 0 字节」。
+static NSURLSessionConfiguration *gAppSessionConfig = nil;
+
+static IMP o_sessionWithConfig = NULL;
+
+static id h_sessionWithConfig(id self, SEL _cmd, NSURLSessionConfiguration *cfg,
+                              id delegate, id queue) {
+    if (cfg && !gAppSessionConfig) {
+        @try { gAppSessionConfig = [cfg copy]; } @catch (NSException *e) {}
+        if (gAppSessionConfig) {
+            MKLog(@"captured app session config: headers=%lu, protoClasses=%lu",
+                  (unsigned long)gAppSessionConfig.HTTPAdditionalHeaders.count,
+                  (unsigned long)gAppSessionConfig.protocolClasses.count);
+        }
+    }
+    return ((id (*)(id, SEL, id, id, id))o_sessionWithConfig)(self, _cmd, cfg, delegate, queue);
+}
+
+// 转发用 session：优先克隆 App 配置，拿不到才退回 shared/default
 static NSURLSession *MKForwardSession(void) {
     static NSURLSession *sess = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSURLSessionConfiguration *c = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        c.timeoutIntervalForRequest = 20;
+        NSURLSessionConfiguration *c = nil;
+
+        if (gAppSessionConfig) {
+            @try { c = [gAppSessionConfig copy]; } @catch (NSException *e) { c = nil; }
+        }
+        if (!c) {
+            MKLog(@"WARN: app session config not captured, fallback to default");
+            c = [NSURLSessionConfiguration defaultSessionConfiguration];
+        }
+
+        // 关键：把我们的协议从克隆配置里摘掉，否则转发会再被自己拦一次
+        NSMutableArray *pc = [NSMutableArray array];
+        for (id k in c.protocolClasses) if (k != [MKNetHookProtocol class]) [pc addObject:k];
+        c.protocolClasses = pc;
+
+        c.timeoutIntervalForRequest  = 20;
+        c.timeoutIntervalForResource = 30;
         c.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-        // 必须共享 cookie，否则转发出去的请求丢登录态 → 401，比不改还糟
         c.HTTPShouldSetCookies = YES;
-        c.HTTPCookieStorage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-        c.HTTPShouldUsePipelining = NO;
+        c.HTTPCookieStorage = c.HTTPCookieStorage ?: [NSHTTPCookieStorage sharedHTTPCookieStorage];
+
         sess = [NSURLSession sessionWithConfiguration:c delegate:nil delegateQueue:nil];
+        MKLog(@"forward session ready: headers=%lu cookies=%d",
+              (unsigned long)c.HTTPAdditionalHeaders.count, (int)c.HTTPShouldSetCookies);
     });
     return sess;
 }
@@ -2147,38 +2178,215 @@ static NSString *MKPreview(NSData *d, NSUInteger maxLen) {
     return s;
 }
 
-// 防伪码取证：请求体 + 响应体落盘
-static void MKDumpWatermark(NSURLRequest *req, NSData *reqBody, NSData *respBody, NSHTTPURLResponse *resp) {
+// 防伪码取证（delegate 层）：请求体 + 完整响应体落盘 + Base64
+static void MKDumpWatermark(NSString *url, NSString *method, NSDictionary *headers,
+                            NSData *reqBody, NSData *respBody, NSInteger status) {
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [doc stringByAppendingPathComponent:@"mk_watermark_dump.txt"];
 
+    NSString *b64 = @"";
+    if (respBody.length) {
+        b64 = [respBody base64EncodedStringWithOptions:0];
+    }
+
     NSMutableString *out = [NSMutableString string];
     [out appendFormat:@"\n===== %@ =====\n", [NSDate date]];
-    [out appendFormat:@"URL    : %@\n", req.URL.absoluteString];
-    [out appendFormat:@"METHOD : %@\n", req.HTTPMethod];
-    [out appendFormat:@"HEADERS: %@\n", req.allHTTPHeaderFields];
-    [out appendFormat:@"BODY   : %lu B\n%@\n", (unsigned long)reqBody.length, MKPreview(reqBody, 4000)];
-    [out appendFormat:@"STATUS : %ld\n", (long)resp.statusCode];
+    [out appendFormat:@"URL    : %@\n", url];
+    [out appendFormat:@"METHOD : %@\n", method];
+    [out appendFormat:@"HEADERS: %@\n", headers];
+    [out appendFormat:@"BODY   : %lu B\n%@\n", (unsigned long)reqBody.length, MKPreview(reqBody, 2000)];
+    [out appendFormat:@"STATUS : %ld\n", (long)status];
     [out appendFormat:@"RESP   : %lu B\n%@\n", (unsigned long)respBody.length, MKPreview(respBody, 4000)];
+    [out appendFormat:@"RESP_B64 (%lu chars):\n%@\n", (unsigned long)b64.length, b64];
 
-    NSString *full = out;
+    // 响应原文单独存一份，方便直接拉出来看
+    if (respBody.length) {
+        NSString *bin = [doc stringByAppendingPathComponent:@"mk_wm_resp.bin"];
+        [respBody writeToFile:bin atomically:YES];
+        MKLog(@"[WM] resp saved: %@ (%lu B)", bin, (unsigned long)respBody.length);
+    }
+
     [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     if (fh) {
-        @try { [fh seekToEndOfFile]; [fh writeData:[full dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        @try { [fh seekToEndOfFile]; [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
         @catch (NSException *e) { MKLog(@"[WM] dump write failed: %@", e.reason); }
     }
-    MKLog(@"[WM] dumped to %@ (%lu B body / %lu B resp)", path,
-          (unsigned long)reqBody.length, (unsigned long)respBody.length);
-    MKLog(@"[WMBody] %@", MKPreview(reqBody, 1500));
-    MKLog(@"[WMResp] %@", MKPreview(respBody, 1500));
+
+    MKLog(@"[WM] %@ status=%ld body=%lu B resp=%lu B", url,
+          (long)status, (unsigned long)reqBody.length, (unsigned long)respBody.length);
+    MKLog(@"[WMBody] %@", MKPreview(reqBody, 1200));
+    MKLog(@"[WMResp] %@", MKPreview(respBody, 1200));
+    if (b64.length) {
+        NSString *head = b64.length > 1600 ? [[b64 substringToIndex:1600] stringByAppendingString:@"...(cut)"] : b64;
+        MKLog(@"[WMRespB64] %@", head);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  NSURLSessionDataDelegate 层嗅探：请求/响应全部由 App 自己发，我们只旁听
+//
+//  为什么要枚举类：marki 的网络栈是 WindMill / JCORE / 各家广告 SDK 各一套，
+//  二进制里有 30 个类实现了 -URLSession:dataTask:didReceiveData:。
+//  逐个挂上去，才能不依赖具体哪个 SDK 在跑。
+// ---------------------------------------------------------------------------
+
+// ---- 原实现登记表：同一个 C 函数挂在多个类上，必须按 (类, SEL) 分别记 orig ----
+#define MK_SNIFF_MAX 8
+typedef struct { Class cls; SEL sel; IMP orig; } MKSniffSlot;
+static MKSniffSlot gSniffSlots[256];
+static int         gSniffSlotCount = 0;
+
+static void MKSniffRemember(Class cls, SEL sel, IMP orig) {
+    if (gSniffSlotCount >= 256) return;
+    gSniffSlots[gSniffSlotCount].cls = cls;
+    gSniffSlots[gSniffSlotCount].sel = sel;
+    gSniffSlots[gSniffSlotCount].orig = orig;
+    gSniffSlotCount++;
+}
+
+static IMP MKSniffOrig(id self, SEL sel) {
+    Class k = object_getClass(self);
+    while (k) {
+        for (int i = 0; i < gSniffSlotCount; i++) {
+            if (gSniffSlots[i].cls == k && sel_isEqual(gSniffSlots[i].sel, sel)) return gSniffSlots[i].orig;
+        }
+        k = class_getSuperclass(k);
+    }
+    return NULL;
+}
+
+// 嗅探表：request 登记 / 响应累积，全部按 taskIdentifier 索引
+static NSMutableDictionary<NSNumber *, NSString *>      *gTaskURL  = nil;
+static NSMutableDictionary<NSNumber *, NSData *>        *gTaskBody = nil;
+static NSMutableDictionary<NSNumber *, NSMutableData *> *gTaskData = nil;
+static NSLock *gSniffLock = nil;
+
+static void MKSniffInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gTaskURL  = [NSMutableDictionary dictionary];
+        gTaskBody = [NSMutableDictionary dictionary];
+        gTaskData = [NSMutableDictionary dictionary];
+        gSniffLock = [NSLock new];
+    });
+}
+
+static BOOL MKIsWatermarkURLString(NSString *s) {
+    if (!s.length) return NO;
+    return ([s containsString:@"getNewWatermark"] || [s containsString:@"getWatermark"]);
+}
+
+// 分片累积（copy 一份，App 的请求/响应完全不受影响）→ 然后必须调原实现
+static void h_didReceiveData(id self, SEL _cmd, id session, id task, NSData *data) {
+    @try {
+        MKSniffInit();
+        NSNumber *key = @([task taskIdentifier]);
+        NSString *u = gTaskURL[key];
+        if (MKIsWatermarkURLString(u) && data.length) {
+            [gSniffLock lock];
+            NSMutableData *buf = gTaskData[key];
+            if (!buf) { buf = [NSMutableData data]; gTaskData[key] = buf; }
+            [buf appendData:data];
+            [gSniffLock unlock];
+        }
+    } @catch (NSException *e) {}
+
+    IMP o = MKSniffOrig(self, _cmd);
+    if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, session, task, data);
+}
+
+// 完成：落盘 + Base64，然后调原实现
+static void h_didComplete(id self, SEL _cmd, id session, id task, NSError *error) {
+    @try {
+        MKSniffInit();
+        NSNumber *key = @([task taskIdentifier]);
+        NSString *u = gTaskURL[key];
+        if (MKIsWatermarkURLString(u)) {
+            NSHTTPURLResponse *resp = (NSHTTPURLResponse *)[task response];
+
+            [gSniffLock lock];
+            NSMutableData *buf = gTaskData[key];
+            NSData *body = gTaskBody[key];
+            [gTaskData removeObjectForKey:key];
+            [gTaskBody removeObjectForKey:key];
+            [gTaskURL  removeObjectForKey:key];
+            [gSniffLock unlock];
+
+            MKDumpWatermark(u, [task originalRequest].HTTPMethod ?: @"POST",
+                            resp.allHeaderFields, body, buf ?: [NSData data],
+                            resp ? resp.statusCode : -1);
+            if (error) MKLog(@"[WM] completed with error: %@", error.localizedDescription);
+        }
+    } @catch (NSException *e) {
+        MKLog(@"[WM] complete handler exception: %@", e.reason);
+    }
+
+    IMP o = MKSniffOrig(self, _cmd);
+    if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, session, task, error);
+}
+
+// 遍历全部已加载类，把这些 delegate 方法都挂上。
+// marki 的网络栈有 WindMill / JCORE / 各家广告 SDK 各一套，二进制里 30 个类实现了它。
+static void MKInstallSessionSniffer(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    MKSniffInit();
+
+    SEL sData = @selector(URLSession:dataTask:didReceiveData:);
+    SEL sComp = @selector(URLSession:task:didCompleteWithError:);
+
+    int numClasses = objc_getClassList(NULL, 0);
+    if (numClasses <= 0) { MKLog(@"[Sniff] objc_getClassList failed"); return; }
+
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)numClasses);
+    numClasses = objc_getClassList(classes, numClasses);
+
+    int scanned = 0, hooked = 0;
+
+    for (int i = 0; i < numClasses; i++) {
+        Class c = classes[i];
+        if (!c) continue;
+        scanned++;
+
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(c, &n);      // 只看本类自己实现的
+        BOOL hasData = NO, hasComp = NO;
+        for (unsigned int k = 0; k < n; k++) {
+            SEL sl = method_getName(ms[k]);
+            if (sel_isEqual(sl, sData)) hasData = YES;
+            else if (sel_isEqual(sl, sComp)) hasComp = YES;
+        }
+        free(ms);
+
+        if (hasData) {
+            Method m = class_getInstanceMethod(c, sData);
+            if (m && method_getImplementation(m) != (IMP)h_didReceiveData) {
+                MKSniffRemember(c, sData, method_getImplementation(m));
+                method_setImplementation(m, (IMP)h_didReceiveData);
+                hooked++;
+            }
+        }
+        if (hasComp) {
+            Method m = class_getInstanceMethod(c, sComp);
+            if (m && method_getImplementation(m) != (IMP)h_didComplete) {
+                MKSniffRemember(c, sComp, method_getImplementation(m));
+                method_setImplementation(m, (IMP)h_didComplete);
+                hooked++;
+            }
+        }
+    }
+    free(classes);
+
+    MKLog(@"[Sniff] scanned %d classes, hooked %d delegate methods", scanned, hooked);
 }
 
 - (void)startLoading {
     NSURLRequest *req = self.request;
 
     // ① 广告：直接失败
-    if (gAdBlockActive && !MKIsGeoURL(req.URL) && ![MKNetHookProtocol isWatermarkURL:req.URL]) {
+    if (gAdBlockActive && !MKIsGeoURL(req.URL)) {
         NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled
                                        userInfo:@{ NSLocalizedDescriptionKey : @"blocked by MarkiFake" }];
         [self.client URLProtocol:self didFailWithError:err];
@@ -2186,13 +2394,9 @@ static void MKDumpWatermark(NSURLRequest *req, NSData *reqBody, NSData *respBody
     }
 
     BOOL isGeo = MKIsGeoURL(req.URL);
-    BOOL isWM  = [MKNetHookProtocol isWatermarkURL:req.URL];
 
     NSMutableURLRequest *fwd = [req mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:@"MKHandled" inRequest:fwd];   // 防自循环
-
-    NSData *reqBody = isWM ? MKReadBody(fwd) : nil;
-    if (isWM) MKLog(@"[WM] %@ body=%lu B", req.URL.path, (unsigned long)reqBody.length);
 
     __weak typeof(self) weakSelf = self;
     NSURLSessionDataTask *t = [MKForwardSession() dataTaskWithRequest:fwd
@@ -2206,10 +2410,6 @@ static void MKDumpWatermark(NSURLRequest *req, NSData *reqBody, NSData *respBody
             @try { out = MKRewriteGeoData(data, req.URL); }
             @catch (NSException *e) { MKLog(@"[Geo] rewrite exception: %@", e.reason); out = data; }
         }
-        if (isWM) {
-            MKDumpWatermark(req, reqBody, data, (NSHTTPURLResponse *)resp);
-        }
-
         if (!resp) {
             NSError *e2 = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse
                                           userInfo:@{ NSLocalizedDescriptionKey : @"MKNetHook: nil response" }];
@@ -2488,6 +2688,37 @@ static id MKWrapDataHandler(id handler, NSURL *url) {
     return [wrapped copy];
 }
 
+// 把 watermark 任务登记进嗅探表（只读，不改请求）
+//   MK_SNIFF_STREAM_BODY = 1 时才去读 HTTPBodyStream（会用 HTTPBody 副本替换，
+//   风险自负：极少数服务端对 chunked / Content-Length 敏感）
+#define MK_SNIFF_STREAM_BODY 0
+
+static void MKRecordTask(id task, NSURLRequest *req) {
+    if (!task || !req) return;
+    NSString *u = req.URL.absoluteString;
+    if (!MKIsWatermarkURLString(u)) return;
+
+    MKSniffInit();
+    NSData *body = req.HTTPBody;
+    BOOL streamed = (body == nil && req.HTTPBodyStream != nil);
+
+#if MK_SNIFF_STREAM_BODY
+    if (streamed) {
+        NSMutableURLRequest *m = [req mutableCopy];
+        body = MKReadBody(m);                      // 会消费原 stream，仅调试用
+    }
+#endif
+
+    NSNumber *key = @([task taskIdentifier]);
+    [gSniffLock lock];
+    gTaskURL[key] = u;
+    if (body.length) gTaskBody[key] = body;
+    [gSniffLock unlock];
+
+    MKLog(@"[WM] task#%ld %@ body=%lu B streamed=%d",
+          (long)[task taskIdentifier], u, (unsigned long)body.length, (int)streamed);
+}
+
 static id h_dtReqCb(id self, SEL _cmd, NSURLRequest *req, id cb) {
     // 我们自己转发出去的请求：打日志可以，绝不能再次改写（否则会二次替换）
     if ([NSURLProtocol propertyForKey:@"MKHandled" inRequest:req]) {
@@ -2495,11 +2726,15 @@ static id h_dtReqCb(id self, SEL _cmd, NSURLRequest *req, id cb) {
     }
     MKLogNetReq(req.URL.absoluteString);
     id wrapped = MKWrapDataHandler(cb, req.URL);
-    return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, MKNeutralize(req), wrapped);
+    id task = ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, MKNeutralize(req), wrapped);
+    MKRecordTask(task, req);
+    return task;
 }
 static id h_dtReq(id self, SEL _cmd, NSURLRequest *req) {
     MKLogNetReq(req.URL.absoluteString);
-    return ((id (*)(id, SEL, id))o_dtReq)(self, _cmd, MKNeutralize(req));
+    id task = ((id (*)(id, SEL, id))o_dtReq)(self, _cmd, MKNeutralize(req));
+    MKRecordTask(task, req);
+    return task;
 }
 static id h_dtUrlCb(id self, SEL _cmd, NSURL *url, id cb) {
     MKLogNetReq(url.absoluteString);
@@ -2534,6 +2769,13 @@ static void MKInstallAdBlock(void) {
     done = YES;
 
     [NSURLProtocol registerClass:[MKNetHookProtocol class]];
+
+    // ① 抓 App 自己的 session 配置（Geo 转发用）
+    // ② 挂 delegate 嗅探（WM 取证，不改任何请求）
+    o_sessionWithConfig = MKHookClass(objc_getClass("NSURLSession"),
+                                      @selector(sessionWithConfiguration:delegate:delegateQueue:),
+                                      (IMP)h_sessionWithConfig, "Net_CaptureSessionConfig");
+    MKInstallSessionSniffer();
 
     // 把拦截器顶到 protocolClasses 第 0 位，压过 SDK 自己设的
     o_setProtocolClasses = MKHook(objc_getClass("NSURLSessionConfiguration"),
