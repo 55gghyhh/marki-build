@@ -8,16 +8,6 @@
 //  设计参照 TG：ioskuka.dylib（XCamera）的三段式做法，全部用 Runtime API 重写：
 //    · 不依赖 libsubstrate，不依赖 Logos 宏 → 可直接被 TrollFools / ElleKit 注入
 //    · 每个 hook 都有自己的直通分支，关掉开关就恢复原厂行为
-//
-//  本文件里所有类名/方法名/类型编码都来自 marki_cn 的静态分析，可复核：
-//    MKLocationManager                   -getRecentLocation / -setRecentLocation:
-//    MKLocationInfo                      -latitude(d) / -longitude(d) / -address(@)
-//    _TtC8marki_cn16MKLocationObject     -latitude(d) / -longitude(d)          [Swift]
-//    _TtC8marki_cn19LocationRealManager  -isMockLocation(B)                    [Swift]
-//    GLVideoSample                       -initWithPixelBuffer:timeStamp:  @32@0:8^{__CVBuffer=}16d24
-//    GLVideoDevice                       -captureOutput:didFinishProcessingPhoto:error:  v40@0:8@16@24@32
-//    MKWeatherInfo                       -condTxt(@) -temperature(q) -aqi(q) -humidity(f)
-//    NSDateFormatter                     -stringFromDate:
 // =============================================================================
 
 #import <UIKit/UIKit.h>
@@ -597,10 +587,9 @@ static BOOL MKSwapPixelBuffer(CVPixelBufferRef pb, double token, const char *who
     size_t bpr = CVPixelBufferGetBytesPerRow(pb);
     BOOL planar = CVPixelBufferIsPlanar(pb);
 
-    MKLog(@"[%@] pb=%p %zu×%zu fmt=%@ bpr=%zu planar=%d iosurface=%p attachments=%p",
+    MKLog(@"[%@] pb=%p %zu×%zu fmt=%@ bpr=%zu planar=%d iosurface=%p",
           tag, pb, w, h, MKFourCC(fmt), bpr, planar,
-          (void *)CVPixelBufferGetIOSurface(pb),
-          (void *)CVPixelBufferGetAttachments(pb, kCVAttachmentMode_ShouldPropagate));
+          (void *)CVPixelBufferGetIOSurface(pb));
 
     BOOL ok = NO;
     if (MKIs32RGBA(fmt)) {
@@ -838,15 +827,6 @@ static void MKInstallLocationHooks(void) {
 
 // =============================================================================
 //  MARK: - 反作弊归零
-//
-//  ① -[CLLocationSourceInformation isSimulatedBySoftware]   iOS15+ 系统模拟定位标记
-//  ② -[CLLocation sourceInformation]                        同上，整对象抹成 nil
-//  ③ -[BMKLocation mockProbability]                          百度：单点概率 (int)
-//  ④ -[BMKLocationManager getMockLocationProbability]        百度：管理器概率 (int)
-//  ⑤ -[TNKLocation mockGPS]                                  腾讯：mock 标记 (BOOL)
-//  ⑥ -[BusinessConfigCenter mockLimitProbability]            服务端阈值 (long long) → 100
-//  ⑦ -[LocationRealManager isMockLocation]                   App 自己的开关
-//  ⑧ -[CLLocation distanceFromLocation:]                     可选：抹掉"位移>200m"判定
 // =============================================================================
 
 static IMP o_simSoftware = NULL, o_bmkMockProb = NULL, o_bmkMgrMockProb = NULL;
