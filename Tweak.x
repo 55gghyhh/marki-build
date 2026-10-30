@@ -2494,7 +2494,7 @@ static id h_dtReqCb(id self, SEL _cmd, NSURLRequest *req, id cb) {
         return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, req, cb);
     }
     MKLogNetReq(req.URL.absoluteString);
-    id wrapped = MKWrapDataHandler(cb, req.URL);(cb, req.URL);
+    id wrapped = MKWrapDataHandler(cb, req.URL);
     return ((id (*)(id, SEL, id, id))o_dtReqCb)(self, _cmd, MKNeutralize(req), wrapped);
 }
 static id h_dtReq(id self, SEL _cmd, NSURLRequest *req) {
