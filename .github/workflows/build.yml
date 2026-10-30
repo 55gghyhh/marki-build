@@ -1,0 +1,32 @@
+name: Build MarkiFake Tweak
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Theos
+        uses: Randomblock1/theos-action@v1
+        with:
+          theos-dir: 'theos'
+          theos-src: 'https://github.com/theos/theos'
+          theos-sdks: 'https://github.com/theos/sdks'
+
+      - name: Compile Tweak
+        run: |
+          export THEOS=${{ github.workspace }}/theos
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Upload Dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarkiFake-dylib
+          path: .theos/obj/MarkiFake.dylib
