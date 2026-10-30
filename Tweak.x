@@ -978,14 +978,16 @@ static int MK_clock_gettime(clockid_t cid, struct timespec *ts) {
     return rc;
 }
 
-#define MK_INTERPOSE(repl, orig) \
-    { (const void *)(repl), (const void *)(orig) }
+struct mk_interpose_s {
+    const void *new_func;
+    const void *orig_func;
+};
 
 __attribute__((used, section("__DATA,__interpose")))
-static const void *mk_clock_interpose[] = {
-    MK_INTERPOSE(MK_time, time),
-    MK_INTERPOSE(MK_gettimeofday, gettimeofday),
-    MK_INTERPOSE(MK_clock_gettime, clock_gettime),
+static const struct mk_interpose_s mk_clock_interpose[] = {
+    { (const void *)MK_time, (const void *)time },
+    { (const void *)MK_gettimeofday, (const void *)gettimeofday },
+    { (const void *)MK_clock_gettime, (const void *)clock_gettime }
 };
 
 // 把 cfg.fakeTime 换算成 delta（相对当前真实时间）
@@ -2215,14 +2217,8 @@ static CLLocationCoordinate2D MKWGS84FromGCJ02(double lat, double lng) {
     }];
 }
 
-@end
 
 
-// =============================================================================
-//  MARK: - PHPicker 代理
-// =============================================================================
-
-@implementation MKPanelViewController (PHPicker)
 
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
