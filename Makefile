@@ -8,6 +8,7 @@ TWEAK_NAME = MarkiFake
 MarkiFake_FILES = Tweak.x
 MarkiFake_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations -Wno-format
 MarkiFake_FRAMEWORKS = UIKit Foundation CoreLocation CoreVideo CoreImage CoreGraphics ImageIO Photos AVFoundation QuartzCore MapKit PhotosUI
+MarkiFake_LIBRARIES = z
 MarkiFake_LDFLAGS = -Wl,-undefined,dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/tweak.mk
