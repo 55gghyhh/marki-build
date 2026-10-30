@@ -12,16 +12,20 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Theos
-        uses: Randomblock1/theos-action@v1
-        with:
-          theos-dir: 'theos'
-          theos-src: 'https://github.com/theos/theos'
-          theos-sdks: 'https://github.com/theos/sdks'
+      - name: Setup Theos and SDKs
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          git clone --depth 1 https://github.com/theos/sdks.git $THEOS/sdks
+
+      - name: Install Dependencies
+        run: |
+          brew install ldid dpkg
 
       - name: Compile Tweak
         run: |
-          export THEOS=${{ github.workspace }}/theos
+          export THEOS=$HOME/theos
+          export PATH=$THEOS/bin:$PATH
           make clean
           make package FINALPACKAGE=1
 
