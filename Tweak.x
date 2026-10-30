@@ -597,10 +597,9 @@ static BOOL MKSwapPixelBuffer(CVPixelBufferRef pb, double token, const char *who
     size_t bpr = CVPixelBufferGetBytesPerRow(pb);
     BOOL planar = CVPixelBufferIsPlanar(pb);
 
-    MKLog(@"[%@] pb=%p %zu×%zu fmt=%@ bpr=%zu planar=%d iosurface=%p attachments=%p",
+     MKLog(@"[%@] pb=%p %zu×%zu fmt=%@ bpr=%zu planar=%d iosurface=%p",
           tag, pb, w, h, MKFourCC(fmt), bpr, planar,
-          (void *)CVPixelBufferGetIOSurface(pb),
-          (void *)CVPixelBufferGetAttachments(pb, kCVAttachmentMode_ShouldPropagate));
+          (void *)CVPixelBufferGetIOSurface(pb));
 
     BOOL ok = NO;
     if (MKIs32RGBA(fmt)) {
