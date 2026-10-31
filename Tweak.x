@@ -694,7 +694,6 @@ static int  gClockScope = 1;
 static BOOL gBypassScope = NO;
 // 当前正在处理的镜像是否允许改 __la_symbol_ptr
 static BOOL gCurImageLazyOK = NO;
-static BOOL gAllowLazyPtr = NO;        // 是否允许改 __la_symbol_ptr（默认禁止）
 
 // 二次硬拒名单：这些块即使路径里含白名单关键字也一律跳过。
 // Flutter / App.framework 带 AOT 快照，改写 GOT 后 JIT/AOT 校验会直接 abort；
@@ -909,9 +908,9 @@ static int MKRebindAllImages(MKHookEntry *tab, int tabCount, const char *tag,
     return total;
 }
 
+// C 层时钟永久停用。保留符号只是为了万一还有调用点，标 unused 避免 -Werror。
+__attribute__((unused))
 static BOOL MKApplyClockHook(void) {
-    // 永久停用：C 层时钟一改，NTP / 证书 / 心跳全崩，且毫无必要（时间只需在渲染层伪造）
-    MKLog(@"CLOCK hook disabled by design (C-layer time is never touched)");
     gClockHooked = NO;
     gClockActive = NO;
     return NO;
@@ -952,23 +951,23 @@ static void MKRecomputeTimeDelta(void) {
 }
 
 // ============================================================================
-//  时钟门控：临时让 C 层 time()/gettimeofday() 返回真实时间
-//
-//  · 引用计数：Geo 和 WM 可能并发，一次 pop 不会误关别人的窗口
-//  · 看门狗：task 走不到 didComplete（超时/取消）时 3 秒强制归位
-//  · 恢复值由 cfg 重算，绝不会停在错误状态
+//  时钟门控：已废弃
+//  C 层 time()/CFAbsoluteTimeGetCurrent() 不再被改写，网络请求天然跑在真实时间上，
+//  所以这两个钩子退化为空实现。保留它们只是为了兼容既有调用点。
 // ============================================================================
-static volatile int gClockGate = 0;
 
+__attribute__((unused))
 static void MKClockGatePush(const char *tag) {
     // 不再需要：底层时钟已不劫持，网络请求本来就跑在真实时间上
     (void)tag;
 }
+__attribute__((unused))
 static void MKClockGatePop(const char *tag) {
     (void)tag;
 }
 
 // C 层时钟已停用，这里保留空实现只为兼容旧调用点
+__attribute__((unused))
 static void MKSetClockScope(int scope) {
     MKLog(@"MKSetClockScope(%d) ignored: C-layer clock hook removed", scope);
     CFG().clockScope = 0;
