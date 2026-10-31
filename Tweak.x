@@ -104,6 +104,7 @@ static void MKLog(NSString *fmt, ...) {
 @property (nonatomic, assign) BOOL      fab;
 @property (nonatomic, assign) BOOL      adBlockOn;
 @property (nonatomic, assign) BOOL      safeClockOn;
+@property (nonatomic, assign) BOOL      renderOnly;        // 只改渲染层：网络/定位/时间全部真实
 @property (nonatomic, assign) NSInteger clockScope;       // 0=关 1=只GPUMarkSDK(安全,默认) 2=白名单全开
 @property (nonatomic, assign) BOOL      verifyOn;          // 验真对齐总开关
 @property (nonatomic, copy)   NSString *verifyExifText;    // 注入的 ImageDescription/Caption，留空=抄真图
@@ -127,6 +128,7 @@ static void MKLog(NSString *fmt, ...) {
         _antiOn = YES; _fill = YES; _flipY = NO; _fab = YES;
         _adBlockOn = NO;
         _safeClockOn = NO;
+        _renderOnly = NO;
         _clockScope = 1;
         _verifyOn = YES;
         _verifyExifText = @"";
@@ -149,6 +151,7 @@ static void MKLog(NSString *fmt, ...) {
     if ([d objectForKey:@"mk.fab"])       self.fab = [d boolForKey:@"mk.fab"];
     if ([d objectForKey:@"mk.adBlock"])   self.adBlockOn = [d boolForKey:@"mk.adBlock"];
     if ([d objectForKey:@"mk.safeClock"]) self.safeClockOn = [d boolForKey:@"mk.safeClock"];
+    if ([d objectForKey:@"mk.renderOnly"]) self.renderOnly = [d boolForKey:@"mk.renderOnly"];
     if ([d objectForKey:@"mk.clockScope"]) self.clockScope = [d integerForKey:@"mk.clockScope"];
     if ([d objectForKey:@"mk.verifyOn"])  self.verifyOn = [d boolForKey:@"mk.verifyOn"];
     if ([d stringForKey:@"mk.verifyExif"]) self.verifyExifText = [d stringForKey:@"mk.verifyExif"];
@@ -181,6 +184,7 @@ static void MKLog(NSString *fmt, ...) {
     [d setBool:self.fab      forKey:@"mk.fab"];
     [d setBool:self.adBlockOn forKey:@"mk.adBlock"];
     [d setBool:self.safeClockOn forKey:@"mk.safeClock"];
+    [d setBool:self.renderOnly forKey:@"mk.renderOnly"];
     [d setInteger:self.clockScope forKey:@"mk.clockScope"];
     [d setBool:self.verifyOn forKey:@"mk.verifyOn"];
     [d setObject:self.verifyExifText ?: @"" forKey:@"mk.verifyExif"];
@@ -421,7 +425,7 @@ static BOOL MKSafeStringKey(Class cls, id model, NSString *key) {
 }
 
 static void MKSpoofModel(id model) {
-    if (!model || !CFG().locOn) return;
+    if (!model || !CFG().locOn || CFG().renderOnly) return;
     Class cls = object_getClass(model);
 
     // 经纬度：写不进去就说明这不是定位模型，直接收手
@@ -464,12 +468,12 @@ static id h_mgrGetRecent(id self, SEL _cmd) {
 }
 static void h_mgrSetRecent(id self, SEL _cmd, id v) { MKSpoofModel(v); ((void (*)(id, SEL, id))o_mgrSetRecent)(self, _cmd, v); }
 static BOOL h_mgrCheckAuth(id self, SEL _cmd) { if (CFG().locOn) return YES; return ((BOOL (*)(id, SEL))o_mgrCheckAuth)(self, _cmd); }
-static double h_infoLat(id self, SEL _cmd) { return CFG().locOn ? CFG().lat : ((double (*)(id, SEL))o_infoLat)(self, _cmd); }
-static double h_infoLng(id self, SEL _cmd) { return CFG().locOn ? CFG().lng : ((double (*)(id, SEL))o_infoLng)(self, _cmd); }
-static double h_objLat(id self, SEL _cmd) { return CFG().locOn ? CFG().lat : ((double (*)(id, SEL))o_objLat)(self, _cmd); }
-static double h_objLng(id self, SEL _cmd) { return CFG().locOn ? CFG().lng : ((double (*)(id, SEL))o_objLng)(self, _cmd); }
-static id h_locMgrLocation(id self, SEL _cmd) { if (CFG().locOn) { CLLocation *f = MKFakeLocation(); if (f) return f; } return ((id (*)(id, SEL))o_locMgrLocation)(self, _cmd); }
-static CLLocationCoordinate2D h_locCoord(id self, SEL _cmd) { if (CFG().locOn) return CLLocationCoordinate2DMake(CFG().lat, CFG().lng); return ((CLLocationCoordinate2D (*)(id, SEL))o_locCoord)(self, _cmd); }
+static double h_infoLat(id self, SEL _cmd) { return (CFG().locOn && !CFG().renderOnly) ? CFG().lat : ((double (*)(id, SEL))o_infoLat)(self, _cmd); }
+static double h_infoLng(id self, SEL _cmd) { return (CFG().locOn && !CFG().renderOnly) ? CFG().lng : ((double (*)(id, SEL))o_infoLng)(self, _cmd); }
+static double h_objLat(id self, SEL _cmd) { return (CFG().locOn && !CFG().renderOnly) ? CFG().lat : ((double (*)(id, SEL))o_objLat)(self, _cmd); }
+static double h_objLng(id self, SEL _cmd) { return (CFG().locOn && !CFG().renderOnly) ? CFG().lng : ((double (*)(id, SEL))o_objLng)(self, _cmd); }
+static id h_locMgrLocation(id self, SEL _cmd) { if (CFG().locOn && !CFG().renderOnly) { CLLocation *f = MKFakeLocation(); if (f) return f; } return ((id (*)(id, SEL))o_locMgrLocation)(self, _cmd); }
+static CLLocationCoordinate2D h_locCoord(id self, SEL _cmd) { if (CFG().locOn && !CFG().renderOnly) return CLLocationCoordinate2DMake(CFG().lat, CFG().lng); return ((CLLocationCoordinate2D (*)(id, SEL))o_locCoord)(self, _cmd); }
 static id h_locSource(id self, SEL _cmd) { if (CFG().antiOn && CFG().locOn) return nil; return ((id (*)(id, SEL))o_locSource)(self, _cmd); }
 static void MKHookDoubleGetter(Class cls, SEL sel, IMP fn, IMP *slot, const char *label) {
     if (!cls) return; Method m = class_getInstanceMethod(cls, sel); if (!m) return; if (MKRetType(m) != 'd') return; *slot = MKHook(cls, sel, fn, label);
@@ -907,10 +911,47 @@ static void MKRecomputeTimeDelta(void) {
     if (!fake) { gTimeDelta = 0; gClockActive = NO; return; }
     time_t real = gOrigTime ? gOrigTime(NULL) : (time_t)[[NSDate date] timeIntervalSince1970];
     gTimeDelta = (int)llround([fake timeIntervalSince1970] - (double)real);
-    gClockActive = (c.timeOn && c.safeClockOn && gClockHooked);
+    gClockActive = (c.timeOn && c.safeClockOn && gClockHooked && !c.renderOnly);
     MKLog(@"时钟 delta=%d 秒 (%.1f 天) active=%d (timeOn=%d safeClock=%d hooked=%d)",
           gTimeDelta, (double)gTimeDelta / 86400.0, (int)gClockActive,
           (int)c.timeOn, (int)c.safeClockOn, (int)gClockHooked);
+}
+
+// ============================================================================
+//  时钟门控：临时让 C 层 time()/gettimeofday() 返回真实时间
+//
+//  · 引用计数：Geo 和 WM 可能并发，一次 pop 不会误关别人的窗口
+//  · 看门狗：task 走不到 didComplete（超时/取消）时 3 秒强制归位
+//  · 恢复值由 cfg 重算，绝不会停在错误状态
+// ============================================================================
+static volatile int gClockGate = 0;
+
+static void MKClockGatePush(const char *tag) {
+    gClockGate++;
+    gClockActive = NO;                 // MK_time 是纯算术，读 volatile 立即生效
+    MKLog(@"[ClockGate] PUSH(%s) depth=%d active=0 (real time)", tag, gClockGate);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gClockGate > 0) {
+            MKLog(@"[ClockGate] watchdog fire, force reset depth=%d", gClockGate);
+            gClockGate = 0;
+            MKFakeCfg *c = CFG();
+            gClockActive = (c.timeOn && c.safeClockOn && gClockHooked && !c.renderOnly);
+            MKLog(@"[ClockGate] restored active=%d", (int)gClockActive);
+        }
+    });
+}
+
+static void MKClockGatePop(const char *tag) {
+    if (gClockGate > 0) gClockGate--;
+    if (gClockGate == 0) {
+        MKFakeCfg *c = CFG();
+        gClockActive = (c.timeOn && c.safeClockOn && gClockHooked && !c.renderOnly);
+        MKLog(@"[ClockGate] POP(%s) depth=0 active=%d", tag, (int)gClockActive);
+    } else {
+        MKLog(@"[ClockGate] POP(%s) depth=%d", tag, gClockGate);
+    }
 }
 
 static void MKSetSafeClock(BOOL on) {
@@ -983,15 +1024,16 @@ static void MKRefreshFakeDate(void) {
     MKRecomputeTimeDelta();
 }
 static id h_stringFromDate(id self, SEL _cmd, NSDate *date) {
-    if (!CFG().timeOn || !gFakeDate) return ((id (*)(id, SEL, id))o_stringFromDate)(self, _cmd, date);
+    if (!CFG().timeOn || !gFakeDate || CFG().renderOnly)
+        return ((id (*)(id, SEL, id))o_stringFromDate)(self, _cmd, date);
     NSString *fmt = nil; @try { fmt = [(NSDateFormatter *)self dateFormat]; } @catch (NSException *e) { fmt = nil; }
     if (!fmt || [MKTimeFormats() containsObject:fmt]) return ((id (*)(id, SEL, id))o_stringFromDate)(self, _cmd, gFakeDate);
     return ((id (*)(id, SEL, id))o_stringFromDate)(self, _cmd, date);
 }
-static id h_dateNow(id self, SEL _cmd) { if (CFG().timeOn && gFakeDate) return gFakeDate; return ((id (*)(id, SEL))o_dateNow)(self, _cmd); }
+static id h_dateNow(id self, SEL _cmd) { if (CFG().timeOn && gFakeDate && !CFG().renderOnly) return gFakeDate; return ((id (*)(id, SEL))o_dateNow)(self, _cmd); }
 static id h_dateDate(id self, SEL _cmd) {
     id real = ((id (*)(id, SEL))o_dateNowClass)(self, _cmd);
-    if (!CFG().timeOn || gTimeDelta == 0) return real;
+    if (!CFG().timeOn || gTimeDelta == 0 || CFG().renderOnly) return real;
     return [real dateByAddingTimeInterval:(NSTimeInterval)gTimeDelta];
 }
 static void MKInstallTimeHooks(void) {
@@ -1007,7 +1049,25 @@ static void h_setTemperature(id self, SEL _cmd, long long v) { if (CFG().wxOn) v
 static id h_getCondTxt(id self, SEL _cmd) { if (CFG().wxOn) return CFG().wxText; return ((id (*)(id, SEL))o_getCondTxt)(self, _cmd); }
 static long long h_getTemperature(id self, SEL _cmd) { if (CFG().wxOn) return CFG().wxTemp; return ((long long (*)(id, SEL))o_getTemperature)(self, _cmd); }
 
+// ============================================================================
+//  渲染层水印文本替换（最终方案）
+//
+//  思路：网络层、定位、时钟全部放行真实的，让服务端完美验签；
+//        只在 GPUMarkSDK 把字符串画进图之前，把文本换掉。
+//
+//  GPUMarkSDK 里文本有 5 个出入口（都在二进制里确认过）：
+//    ① GMWatermarkItemCallback -updateItemWithId:withContent:          (宿主 push)
+//    ② GPUMarkImageFilter    -getWatermarkItemContentWithId:          (引擎 pull, 同步)
+//    ③ GMCoreRender          -getWatermarkItemContentWithId:          (引擎 pull, 同步)
+//    ④ GMCVPixelBuffer       -getWatermarkItemContentWithId:withCompletion:  (引擎 pull, 异步)
+//    ⑤ GPUMarkImageFilter    -renderMarkWithInputTexture:andSize:andData:
+//  ①②③ 全部接管；④ 只旁听打日志（它的 block 签名未知，裹一层会崩）；
+//  ⑤ 是最终提交点，文本此时已固化成纹理，改不了，跳过。
+// ============================================================================
+
 static IMP o_gmUpdateItem = NULL, o_gmGetContent = NULL;
+static IMP o_gmGetContent2 = NULL, o_gmGetContentAsync = NULL;
+
 static BOOL MKLooksLikeWeather(NSString *s) {
     if (![s isKindOfClass:[NSString class]]) return NO;
     if (s.length == 0 || s.length > 24) return NO;
@@ -1021,18 +1081,150 @@ static NSString *MKFakeWeatherText(NSString *orig) {
     if ([orig containsString:@"°"] || [orig containsString:@"℃"]) return [NSString stringWithFormat:@"%@ %lld°", c.wxText, c.wxTemp];
     return c.wxText;
 }
+
+// ---- 日期/时间正则（惰性建一次）----
+static NSRegularExpression *gReDate = nil, *gReDateCN = nil, *gReTime = nil;
+static void MKInitWatermarkRegex(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSError *e = nil;
+        gReDate   = [NSRegularExpression regularExpressionWithPattern:@"(\\d{4})[-/](\\d{1,2})[-/](\\d{1,2})" options:0 error:&e];
+        gReDateCN = [NSRegularExpression regularExpressionWithPattern:@"(\\d{4})年(\\d{1,2})月(\\d{1,2})日" options:0 error:&e];
+        gReTime   = [NSRegularExpression regularExpressionWithPattern:@"(\\d{1,2}):(\\d{2})(:\\d{2})?" options:0 error:&e];
+    });
+}
+
+static BOOL MKLooksLikeAddress(NSString *s) {
+    if (![s isKindOfClass:[NSString class]]) return NO;
+    if (s.length < 4 || s.length > 64) return NO;
+    if (MKLooksLikeWeather(s)) return NO;
+    NSArray *kw = @[@"省", @"市", @"区", @"县", @"路", @"街", @"道", @"巷", @"镇", @"村",
+                    @"号", @"小区", @"大厦", @"广场", @"公园", @"基地", @"园区", @"酒店",
+                    @"公寓", @"花园", @"写字楼", @"中心"];
+    for (NSString *k in kw) if ([s containsString:k]) return s.length >= 8;
+    return NO;
+}
+
+// 把 fakeTime 拆成 日期串 / 时间串
+static void MKFakeDateParts(NSString **dateOut, NSString **timeOut) {
+    NSString *ft = CFG().fakeTime ?: @"2026-01-01 12:00:00";
+    NSArray *p = [ft componentsSeparatedByString:@" "];
+    *dateOut = p.count > 0 ? p[0] : @"2026-01-01";
+    *timeOut = p.count > 1 ? p[1] : @"12:00:00";
+}
+
+// 只替换串里的日期/时间片段，别的一个字不动
+static NSString *MKReplaceDateTime(NSString *s) {
+    MKInitWatermarkRegex();
+    NSString *d = nil, *t = nil;
+    MKFakeDateParts(&d, &t);
+
+    NSArray *dParts = [d componentsSeparatedByString:@"-"];
+    NSString *dSlash = d, *dCN = d;
+    if (dParts.count == 3) {
+        dSlash = [NSString stringWithFormat:@"%@/%@/%@", dParts[0], dParts[1], dParts[2]];
+        dCN    = [NSString stringWithFormat:@"%@年%ld月%ld日",
+                  dParts[0], (long)[dParts[1] integerValue], (long)[dParts[2] integerValue]];
+    }
+
+    NSMutableString *out = [s mutableCopy];
+
+    // 日期（yyyy-MM-dd / yyyy/MM/dd）
+    NSArray *ms = [gReDate matchesInString:out options:0 range:NSMakeRange(0, out.length)];
+    for (NSInteger i = (NSInteger)ms.count - 1; i >= 0; i--) {
+        NSTextCheckingResult *m = ms[i];
+        NSString *seg = [out substringWithRange:m.range];
+        NSString *repl = [seg containsString:@"/"] ? dSlash : d;
+        [out replaceCharactersInRange:m.range withString:repl];
+    }
+    // 日期（yyyy年M月d日）
+    ms = [gReDateCN matchesInString:out options:0 range:NSMakeRange(0, out.length)];
+    for (NSInteger i = (NSInteger)ms.count - 1; i >= 0; i--) {
+        [out replaceCharactersInRange:[ms[i] range] withString:dCN];
+    }
+    // 时间（H:mm / H:mm:ss）
+    ms = [gReTime matchesInString:out options:0 range:NSMakeRange(0, out.length)];
+    for (NSInteger i = (NSInteger)ms.count - 1; i >= 0; i--) {
+        NSTextCheckingResult *m = ms[i];
+        NSString *seg = [out substringWithRange:m.range];
+        BOOL withSec = (seg.length >= 7);
+        NSString *repl = withSec ? t : (t.length >= 5 ? [t substringToIndex:5] : t);
+        [out replaceCharactersInRange:m.range withString:repl];
+    }
+    return out;
+}
+
+// 总入口：itemId 只用来打日志，判断全靠内容形态
+static id MKRewriteWatermarkText(id content, int itemId, const char *src) {
+    if (![content isKindOfClass:[NSString class]]) return content;
+    NSString *s = (NSString *)content;
+    if (!s.length) return content;
+
+    MKFakeCfg *c = CFG();
+    NSString *out = s;
+    NSString *why = nil;
+
+    BOOL hasDate = NO;
+    MKInitWatermarkRegex();
+    if ([gReDate numberOfMatchesInString:s options:0 range:NSMakeRange(0, s.length)] ||
+        [gReDateCN numberOfMatchesInString:s options:0 range:NSMakeRange(0, s.length)] ||
+        [gReTime numberOfMatchesInString:s options:0 range:NSMakeRange(0, s.length)]) {
+        hasDate = YES;
+    }
+
+    if (hasDate && c.timeOn) {
+        out = MKReplaceDateTime(s);
+        why = @"time";
+    } else if (!hasDate && c.locOn && MKLooksLikeAddress(s)) {
+        // 纯地址串（不含日期），整串换掉最干净
+        out = c.addr.length ? c.addr : s;
+        why = @"addr";
+    } else if (c.wxOn && MKLooksLikeWeather(s)) {
+        out = MKFakeWeatherText(s);
+        why = @"weather";
+    }
+
+    if (why) {
+        MKLog(@"[Render-%s] item#%d  \"%@\"  ->  \"%@\"", src, itemId, s, out);
+    } else if (s.length && s.length < 40) {
+        MKLOG_ONCE(@"· 未命中替换的 item 示例：item#%d \"%@\"（看日志后可加白名单）", itemId, s);
+    }
+    return out;
+}
+
+// ① 宿主 push
 static void h_gmUpdateItem(id self, SEL _cmd, int itemId, id content) {
-    if (CFG().wxOn && MKLooksLikeWeather(content)) content = MKFakeWeatherText(content);
+    content = MKRewriteWatermarkText(content, itemId, "push");
     ((void (*)(id, SEL, int, id))o_gmUpdateItem)(self, _cmd, itemId, content);
 }
+// ② GPUMarkImageFilter pull
 static id h_gmGetContent(id self, SEL _cmd, int itemId) {
     id r = ((id (*)(id, SEL, int))o_gmGetContent)(self, _cmd, itemId);
-    if (MKLooksLikeWeather(r)) { if (CFG().wxOn) return MKFakeWeatherText(r); }
-    return r;
+    return MKRewriteWatermarkText(r, itemId, "pull");
 }
+// ③ GMCoreRender pull
+static id h_gmGetContent2(id self, SEL _cmd, int itemId) {
+    id r = ((id (*)(id, SEL, int))o_gmGetContent2)(self, _cmd, itemId);
+    return MKRewriteWatermarkText(r, itemId, "core");
+}
+// ④ GMCVPixelBuffer async pull：惰性 block 签名不明，只旁听，裹一层会崩
+static void h_gmGetContentAsync(id self, SEL _cmd, int itemId, id completion) {
+    ((void (*)(id, SEL, int, id))o_gmGetContentAsync)(self, _cmd, itemId, completion);
+    MKLOG_ONCE(@"[AsyncPull] item#%d block=%p（如需接管请看这条日志）", itemId, completion);
+}
+
 static void MKInstallWeatherHooks(void) {
-    o_gmUpdateItem = MKHook(objc_getClass("GMWatermarkItemCallback"), MKSEL(updateItemWithId:withContent:), (IMP)h_gmUpdateItem, "Wx_Engine1");
-    o_gmGetContent = MKHook(objc_getClass("GPUMarkImageFilter"), MKSEL(getWatermarkItemContentWithId:), (IMP)h_gmGetContent, "Wx_Engine2");
+    o_gmUpdateItem = MKHook(objc_getClass("GMWatermarkItemCallback"),
+                            MKSEL(updateItemWithId:withContent:), (IMP)h_gmUpdateItem, "Render_Push");
+    o_gmGetContent = MKHook(objc_getClass("GPUMarkImageFilter"),
+                            MKSEL(getWatermarkItemContentWithId:), (IMP)h_gmGetContent, "Render_PullFilter");
+    o_gmGetContent2 = MKHook(objc_getClass("GMCoreRender"),
+                             MKSEL(getWatermarkItemContentWithId:), (IMP)h_gmGetContent2, "Render_PullCore");
+    o_gmGetContentAsync = MKHook(objc_getClass("GMCVPixelBuffer"),
+                                 MKSEL(getWatermarkItemContentWithId:withCompletion:),
+                                 (IMP)h_gmGetContentAsync, "Render_PullAsync");
+
+    // 天气模型（保持原有）
     Class w = objc_getClass("MKWeatherInfo");
     if (!w) return;
     o_setCondTxt = MKHook(w, MKSEL(setCondTxt:), (IMP)h_setCondTxt, "Wx_SetTxt");
@@ -1824,7 +2016,7 @@ static void MKInstallDatumHooks(void) {
     MKFakeCfg *c = CFG();
     [self.switches[0] setOn:c.locOn animated:NO]; [self.switches[1] setOn:c.timeOn animated:NO]; [self.switches[2] setOn:c.wxOn animated:NO]; [self.switches[3] setOn:c.photoOn animated:NO]; [self.switches[4] setOn:c.safeClockOn animated:NO]; [self.switches[5] setOn:c.adBlockOn animated:NO]; [self.switches[6] setOn:c.antiOn animated:NO];
     NSString *(^Y)(BOOL) = ^NSString *(BOOL on) { return on ? @"开" : @"关"; };
-    self.statusLabel.text = [NSString stringWithFormat:@"定位：%@  时间：%@  替拍：%@\n天气：%@  反作弊：%@\n时钟：%@  广告：%@", Y(c.locOn), Y(c.timeOn), Y(c.photoOn), Y(c.wxOn), Y(c.antiOn), (c.clockScope == 0 ? @"关" : (c.clockScope == 1 ? (gClockHooked ? @"安全" : @"失败") : (gClockHooked ? @"全开" : @"失败"))), c.adBlockOn ? (gAdBlockActive ? @"拦" : @"待注册") : @"关"];
+    self.statusLabel.text = [NSString stringWithFormat:@"%@\n定位：%@  时间：%@  替拍：%@\n天气：%@  反作弊：%@\n时钟：%@  广告：%@", (c.renderOnly ? @"【渲染层】网络全真实" : @"【全伪造】"), Y(c.locOn), Y(c.timeOn), Y(c.photoOn), Y(c.wxOn), Y(c.antiOn), (c.clockScope == 0 ? @"关" : (c.clockScope == 1 ? (gClockHooked ? @"安全" : @"失败") : (gClockHooked ? @"全开" : @"失败"))), c.adBlockOn ? (gAdBlockActive ? @"拦" : @"待注册") : @"关"];
     NSString *img = c.imgPath.length ? c.imgPath : @"@latest"; if (img.length > 28) img = [img substringFromIndex:img.length - 28];
     CLLocationCoordinate2D g2 = MKGCJ02FromWGS84(c.lat, c.lng);
     CLLocationCoordinate2D b2 = MKBD09FromWGS84(c.lat, c.lng);
@@ -1935,6 +2127,32 @@ static void MKInstallDatumHooks(void) {
                                              handler:^(UIAlertAction *a) {
             MKSetClockScope(2); [weakSelf refreshStatus]; MKSnack(@"已全开，注意观察是否闪退");
         }]];
+        // 最终方案：网络/定位/时间全部放行真实，只在水印画进图之前换文本
+        [ac addAction:[UIAlertAction actionWithTitle:@"只改渲染层（网络全真实，推荐）"
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            MKFakeCfg *cc = CFG();
+            cc.renderOnly = YES;
+            cc.safeClockOn = NO;
+            cc.clockScope = 0;
+            cc.locOn = YES;          // 只给渲染层用（各 getter 在 renderOnly 下已直通）
+            cc.timeOn = YES;
+            if (gClockHooked) MKRevertClockHook();
+            [cc save];
+            MKLog(@"MODE=RENDER_ONLY 网络/定位/时间全部真实，只在渲染层换文本");
+            [weakSelf refreshStatus];
+            MKSnack(@"只改渲染层：服务端验真应全绿");
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"关闭渲染层模式"
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            MKFakeCfg *cc = CFG();
+            cc.renderOnly = NO;
+            [cc save];
+            [weakSelf refreshStatus];
+            MKSnack(@"已退出渲染层模式");
+        }]];
+
         [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
         if (ac.popoverPresentationController) {
@@ -2316,6 +2534,7 @@ static void h_didComplete(id self, SEL _cmd, id session, id task, NSError *error
             MKDumpWatermark(u, [task originalRequest].HTTPMethod ?: @"POST",
                             resp.allHeaderFields, body, buf ?: [NSData data],
                             resp ? resp.statusCode : -1);
+            MKClockGatePop("wm-done");          // 请求结束立刻恢复假时间
             if (error) MKLog(@"[WM] completed with error: %@", error.localizedDescription);
         }
     } @catch (NSException *e) {
@@ -2542,19 +2761,39 @@ static NSData *MKGunzip(NSData *data) {
     return out.length ? out : nil;
 }
 
+// 1 = 连坐标一起改（会破坏 placeId↔location 自洽，服务端可能返回空）
+// 0 = 只改显示文本，坐标 / placeId / 行政区划全部原样透传   ← 默认
+#define MK_GEO_REWRITE_COORD 0
+
+// 只列「纯展示、不参与服务端校验」的字段。
+// address / addr / detailAddress / 各级行政区划故意排除：
+// getNewWatermark 的 78 B 密文里可能带着 location+placeId，一旦和改写后的字段对不上
+// 服务端就返回 0 字节（这条已由运行时日志证实：唯一成功那次在所有 Geo 改写之前）。
 static NSSet *MKAddrKeys(void) {
     static NSSet *s = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         s = [NSSet setWithArray:@[
-            @"name", @"poiName", @"poi", @"address", @"addr", @"addressName",
-            @"formattedAddress", @"fullAddress", @"detailAddress", @"poiAddress",
-            @"locationName", @"locationAddress", @"districtName", @"cityName",
-            @"provinceName", @"townName", @"streetName", @"road",
-            @"suggestion", @"displayName",
+            @"name", @"poiName", @"displayName", @"suggestion",
+            @"formattedAddress", @"fullAddress", @"addressName",
         ]];
     });
     return s;
+}
+
+// 这些 key 的整棵子树一律原样透传，绝不递归改写
+static BOOL MKIsGeoOpaqueKey(NSString *k) {
+    static NSSet *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[
+            @"location", @"point", @"coordinate", @"geoPoint", @"center",
+            @"placeId", @"id", @"poiId", @"uid", @"poiUid",
+            @"province", @"city", @"district", @"town", @"adcode", @"citycode",
+            @"category", @"tag", @"tagId", @"distance",
+        ]];
+    });
+    return [s containsObject:k];
 }
 
 static BOOL MKIsLatKey(NSString *k) {
@@ -2580,25 +2819,43 @@ static id MKRewriteGeoJSON(id obj, CLLocationCoordinate2D coord, int *hits) {
             NSString *k = (NSString *)key;
             id v = [(NSDictionary *)obj objectForKey:k];
 
+            // ① 不透明子树：location / placeId / 行政区划 … 原样透传，不递归
+            if (MKIsGeoOpaqueKey(k)) {
+                out[k] = v;
+                continue;
+            }
+
+            // ② 只改纯展示文本
             if ([MKAddrKeys() containsObject:k] && CFG().addr.length) {
                 out[k] = CFG().addr;
                 (*hits)++;
                 continue;
             }
+
+            // ③ 坐标：默认不动（动了 placeId 就对不上）
             if (MKIsLatKey(k)) {
+#if MK_GEO_REWRITE_COORD
                 out[k] = [v isKindOfClass:[NSString class]]
                        ? [NSString stringWithFormat:@"%.8f", coord.latitude]
                        : @(coord.latitude);
                 (*hits)++;
+#else
+                out[k] = v;
+#endif
                 continue;
             }
             if (MKIsLngKey(k)) {
+#if MK_GEO_REWRITE_COORD
                 out[k] = [v isKindOfClass:[NSString class]]
                        ? [NSString stringWithFormat:@"%.8f", coord.longitude]
                        : @(coord.longitude);
                 (*hits)++;
+#else
+                out[k] = v;
+#endif
                 continue;
             }
+
             out[k] = MKRewriteGeoJSON(v, coord, hits);
         }
         return out;
@@ -2623,6 +2880,7 @@ static CLLocationCoordinate2D MKCoordForURL(NSURL *url, const char **datumName) 
 
 static NSData *MKRewriteGeoData(NSData *data, NSURL *url) {
     if (!data.length) return data;
+    if (CFG().renderOnly) return data;      // 渲染层模式：网络数据全部原样，让服务端完美验签
     if (!CFG().locOn || !CFG().addr.length) return data;
 
     NSData *plain = data;
@@ -2717,6 +2975,9 @@ static void MKRecordTask(id task, NSURLRequest *req) {
 
     MKLog(@"[WM] task#%ld %@ body=%lu B streamed=%d",
           (long)[task taskIdentifier], u, (unsigned long)body.length, (int)streamed);
+
+    // 从这个 task 建立到它完成，C 层 time() 返回真实时间，签名才不会用假时间戳
+    MKClockGatePush("wm-sign");
 }
 
 static id h_dtReqCb(id self, SEL _cmd, NSURLRequest *req, id cb) {
