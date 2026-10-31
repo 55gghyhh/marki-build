@@ -1280,7 +1280,7 @@ typedef struct { unsigned long reserved; unsigned long size; void *copy; void *d
 
 static const char *MKBlockSignature(id blk) {
     if (!blk) return NULL;
-    MKBlockLayout *l = (MKBlockLayout *)blk;
+    MKBlockLayout *l = (__bridge MKBlockLayout *)blk;
     if (!l->descriptor) return NULL;
     MKBlockDesc *d = (MKBlockDesc *)l->descriptor;
     return d->signature;
@@ -2837,6 +2837,9 @@ static NSData *MKPatchWMTemplate(NSData *tpl) {
     id json = [NSJSONSerialization JSONObjectWithData:tpl options:0 error:NULL];
     if (![json isKindOfClass:[NSDictionary class]]) return nil;
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-retain-cycles"
+
     __block int hits = 0;
     __block void (^walk)(NSMutableDictionary *);
     walk = ^(NSMutableDictionary *d) {
@@ -2855,10 +2858,16 @@ static NSData *MKPatchWMTemplate(NSData *tpl) {
             }
         }
     };
-
+    
     NSMutableDictionary *root = [json mutableCopy];
     walk(root);
 
+#pragma clang diagnostic pop
+
+    if (!hits) {
+        MKLog(@"[WM] template had no display field to patch, replay as-is");
+    }
+    
     NSData *out = [NSJSONSerialization dataWithJSONObject:root options:0 error:NULL];
     MKLog(@"[WM] template patched: %d fields -> %lu B", hits, (unsigned long)out.length);
     return out ?: tpl;
