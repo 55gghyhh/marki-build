@@ -105,6 +105,7 @@ static void MKLog(NSString *fmt, ...) {
 @property (nonatomic, assign) BOOL      adBlockOn;
 @property (nonatomic, assign) BOOL      safeClockOn;
 @property (nonatomic, assign) BOOL      renderOnly;        // 只改渲染层：网络/定位/时间全部真实
+@property (nonatomic, assign) BOOL      replayWM;          // 服务端失败时用模板回放一个成功响应
 @property (nonatomic, assign) NSInteger clockScope;       // 0=关 1=只GPUMarkSDK(安全,默认) 2=白名单全开
 @property (nonatomic, assign) BOOL      verifyOn;          // 验真对齐总开关
 @property (nonatomic, copy)   NSString *verifyExifText;    // 注入的 ImageDescription/Caption，留空=抄真图
@@ -129,6 +130,7 @@ static void MKLog(NSString *fmt, ...) {
         _adBlockOn = NO;
         _safeClockOn = NO;
         _renderOnly = NO;
+        _replayWM = YES;
         _clockScope = 1;
         _verifyOn = YES;
         _verifyExifText = @"";
@@ -152,6 +154,7 @@ static void MKLog(NSString *fmt, ...) {
     if ([d objectForKey:@"mk.adBlock"])   self.adBlockOn = [d boolForKey:@"mk.adBlock"];
     if ([d objectForKey:@"mk.safeClock"]) self.safeClockOn = [d boolForKey:@"mk.safeClock"];
     if ([d objectForKey:@"mk.renderOnly"]) self.renderOnly = [d boolForKey:@"mk.renderOnly"];
+    if ([d objectForKey:@"mk.replayWM"])   self.replayWM = [d boolForKey:@"mk.replayWM"];
     if ([d objectForKey:@"mk.clockScope"]) self.clockScope = [d integerForKey:@"mk.clockScope"];
     if ([d objectForKey:@"mk.verifyOn"])  self.verifyOn = [d boolForKey:@"mk.verifyOn"];
     if ([d stringForKey:@"mk.verifyExif"]) self.verifyExifText = [d stringForKey:@"mk.verifyExif"];
@@ -185,6 +188,7 @@ static void MKLog(NSString *fmt, ...) {
     [d setBool:self.adBlockOn forKey:@"mk.adBlock"];
     [d setBool:self.safeClockOn forKey:@"mk.safeClock"];
     [d setBool:self.renderOnly forKey:@"mk.renderOnly"];
+    [d setBool:self.replayWM   forKey:@"mk.replayWM"];
     [d setInteger:self.clockScope forKey:@"mk.clockScope"];
     [d setBool:self.verifyOn forKey:@"mk.verifyOn"];
     [d setObject:self.verifyExifText ?: @"" forKey:@"mk.verifyExif"];
@@ -491,15 +495,15 @@ static void MKHookStringGetter(Class cls, SEL sel, IMP fn, IMP *slot, const char
 static IMP o_infoAddr = NULL, o_objAddr = NULL, o_objNowAddr = NULL;
 
 static id h_infoAddr(id self, SEL _cmd) {
-    if (CFG().locOn && CFG().addr.length) return CFG().addr;
+    if (CFG().locOn && !CFG().renderOnly && CFG().addr.length) return CFG().addr;
     return o_infoAddr ? ((id (*)(id, SEL))o_infoAddr)(self, _cmd) : nil;
 }
 static id h_objAddr(id self, SEL _cmd) {
-    if (CFG().locOn && CFG().addr.length) return CFG().addr;
+    if (CFG().locOn && !CFG().renderOnly && CFG().addr.length) return CFG().addr;
     return o_objAddr ? ((id (*)(id, SEL))o_objAddr)(self, _cmd) : nil;
 }
 static id h_objNowAddr(id self, SEL _cmd) {
-    if (CFG().locOn && CFG().addr.length) return CFG().addr;
+    if (CFG().locOn && !CFG().renderOnly && CFG().addr.length) return CFG().addr;
     return o_objNowAddr ? ((id (*)(id, SEL))o_objNowAddr)(self, _cmd) : nil;
 }
 
@@ -1154,6 +1158,46 @@ static NSString *MKReplaceDateTime(NSString *s) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+//  GPUMark 会把 {"address":...,"tips":...} 这种 JSON 当「字符串」存进 item。
+//  上一版整串覆盖成纯地址，引擎解析失败 → 水印退化成默认文案（截图里的
+//  “在这里”就是这么来的）。所以先识别 JSON，只改里面的 address 值，再序列化回去。
+// ---------------------------------------------------------------------------
+static NSString *MKRewriteJSONString(NSString *s, int *did) {
+    if (did) *did = 0;
+    if (s.length < 8 || s.length > 512) return s;
+    if (![s hasPrefix:@"{"]) return s;
+    if (![s containsString:@"address"] && ![s containsString:@"tips"]) return s;
+
+    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d) return s;
+    id json = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
+    if (![json isKindOfClass:[NSDictionary class]]) return s;
+
+    NSMutableDictionary *mut = [json mutableCopy];
+    int hits = 0;
+    for (NSString *k in [json allKeys]) {
+        id v = json[k];
+        if (![v isKindOfClass:[NSString class]]) continue;
+        if (([k isEqualToString:@"address"] || [k isEqualToString:@"name"] ||
+             [k isEqualToString:@"formattedAddress"] || [k isEqualToString:@"tips"]) &&
+            CFG().addr.length) {
+            if ([k isEqualToString:@"tips"] && ![v length]) continue;   // 空的 tips 别塞地址
+            mut[k] = CFG().addr;
+            hits++;
+        }
+    }
+    if (!hits) return s;
+
+    NSData *out = [NSJSONSerialization dataWithJSONObject:mut options:0 error:NULL];
+    NSString *ret = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
+    if (!ret) return s;
+
+    if (did) *did = 1;
+    MKLog(@"[Render-json] %@  ->  %@", s, ret);
+    return ret;
+}
+
 // 总入口：itemId 只用来打日志，判断全靠内容形态
 static id MKRewriteWatermarkText(id content, int itemId, const char *src) {
     if (![content isKindOfClass:[NSString class]]) return content;
@@ -1162,6 +1206,12 @@ static id MKRewriteWatermarkText(id content, int itemId, const char *src) {
 
     MKFakeCfg *c = CFG();
     if (!c.timeOn && !c.locOn && !c.wxOn) return content;   // 三个开关全关，零开销直通
+
+    // ① JSON 字符串：只改字段值，绝不整串覆盖（否则引擎解析失败 → “在这里”）
+    int didJson = 0;
+    NSString *json = MKRewriteJSONString(s, &didJson);
+    if (didJson) return json;
+
     NSString *out = s;
     NSString *why = nil;
 
@@ -1230,7 +1280,7 @@ typedef struct { unsigned long reserved; unsigned long size; void *copy; void *d
 
 static const char *MKBlockSignature(id blk) {
     if (!blk) return NULL;
-    MKBlockLayout *l = (__bridge MKBlockLayout *)blk;
+    MKBlockLayout *l = (MKBlockLayout *)blk;
     if (!l->descriptor) return NULL;
     MKBlockDesc *d = (MKBlockDesc *)l->descriptor;
     return d->signature;
@@ -1498,7 +1548,7 @@ static IMP MKRegeoOrig(id obj, SEL sel) {
 }
 #define MK_RG_GETTER(fn, expr) \
     static id fn(id s_, SEL c) { \
-        if (CFG().locOn) return (expr); \
+        if (CFG().locOn && !CFG().renderOnly) return (expr); \
         IMP o = MKRegeoOrig(s_, c); \
         return o ? ((id (*)(id, SEL))o)(s_, c) : nil; \
     }
@@ -1514,7 +1564,7 @@ MK_RG_GETTER(mk_rgStreetNum, @"")
 MK_RG_GETTER(mk_rgPoiName,   CFG().addr)
 
 static BOOL mk_rgValid(id s_, SEL c) {
-    if (CFG().locOn) return YES;
+    if (CFG().locOn && !CFG().renderOnly) return YES;
     IMP o = MKRegeoOrig(s_, c);
     return o ? ((BOOL (*)(id, SEL))o)(s_, c) : NO;
 }
@@ -1572,7 +1622,7 @@ static void MKForceRegeocodeClass(const char *clsName, const char *tag) {
 static IMP o_reverseGeo = NULL;
 
 static void mk_reverseGeo(id self, SEL _cmd, CLLocation *loc, id handler) {
-    if (CFG().locOn && loc && handler) {
+    if (CFG().locOn && !CFG().renderOnly && loc && handler) {
         CLLocationCoordinate2D c = loc.coordinate;
         double dLat = fabs(c.latitude  - CFG().lat);
         double dLng = fabs(c.longitude - CFG().lng);
@@ -1689,6 +1739,12 @@ static IMP o_bwExtract = NULL, o_bwDecode = NULL;
 static id gBlindHash = nil;
 
 static id mk_bwExtract(id self, SEL _cmd, id img) {
+    // 渲染层模式：哈希必须来自当前这张图，绝不能用「上次学到的」张冠李戴
+    if (CFG().renderOnly) {
+        id rr = ((id (*)(id, SEL, id))o_bwExtract)(self, _cmd, img);
+        if (rr && ![rr isKindOfClass:[NSNull class]]) gBlindHash = rr;
+        return rr;
+    }
     id r = ((id (*)(id, SEL, id))o_bwExtract)(self, _cmd, img);
     if (r && ![r isKindOfClass:[NSNull class]]) {
         if (!gBlindHash || ![gBlindHash isEqual:r]) {
@@ -1727,7 +1783,8 @@ static void MKInstallVerifyHooks(void) {
                           (IMP)mk_reverseGeo, "Verify_CLGeocoder");
 
     // ③ EXIF 注入（走 fishhook，改 marki_cn 的 __got 槽位）
-    gVerifyExifOn = CFG().verifyOn;
+    // 渲染层模式下必须关掉：EXIF 被改会进 78 B 请求体，服务端一比对就 unauthorized
+    gVerifyExifOn = CFG().verifyOn && !CFG().renderOnly;
     if (gVerifyExifOn) {
         if (!gOrigCGISProps) {
             gOrigCGISProps = (CFDictionaryRef (*)(CGImageSourceRef, size_t, CFDictionaryRef))
@@ -2726,6 +2783,101 @@ static void h_didReceiveData(id self, SEL _cmd, id session, id task, NSData *dat
     if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, session, task, data);
 }
 
+// ---------------------------------------------------------------------------
+//  防伪码模板回放（楚门的世界）
+//
+//  服务端现在返回的是 62 B 的 protobuf 错误包：
+//    field1 = -101, field2 = "unauthorized user!"   （Base64 已解码确认）
+//  不管是因为盲水印哈希、EXIF 校验还是 token，只要 App 拿不到 938 B 的明文 JSON
+//  它就不会生成防伪码。所以：把「最后一次真正成功」的 JSON 存成模板，之后凡是
+//  错误响应，就用模板 + 我们的地址打补丁，直接喂给 App。
+//
+//  注意：伪造的响应只骗 App 本地，服务端数据库里没有记录 —— 换台机器扫码大概率
+//  仍显示真实数据。这是「本机闭环」，不是「服务端闭环」。
+// ---------------------------------------------------------------------------
+static NSData *MKLoadWMTemplate(void) {
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [doc stringByAppendingPathComponent:@"mk_wm_template.json"];
+    NSData *d = [NSData dataWithContentsOfFile:path];
+    return d.length > 32 ? d : nil;
+}
+
+static void MKSaveWMTemplate(NSData *resp) {
+    if (resp.length <= 32) return;
+    const uint8_t *b = resp.bytes;
+    if (resp.length > 2 && b[0] == 0x1f && b[1] == 0x8b) return;   // gzip 的先不存，免得回放时解不开
+    NSUInteger i = 0;
+    while (i < resp.length && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n')) i++;
+    if (i >= resp.length || (b[i] != '{' && b[i] != '[')) return;   // 只认明文 JSON
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [doc stringByAppendingPathComponent:@"mk_wm_template.json"];
+    if ([resp writeToFile:path atomically:YES]) {
+        MKLog(@"[WM] template saved %@ (%lu B)", path, (unsigned long)resp.length);
+    }
+}
+
+// 判断是不是「失败响应」
+//   · 空 → 失败
+//   · 明文 JSON（跳过前导空白）→ 成功
+//   · gzip（Content-Encoding 包过一层）→ 当作成功，别覆盖
+//   · 其它二进制（protobuf 错误包 field1=-101 "unauthorized user!"）→ 失败
+static BOOL MKIsWMFailure(NSData *resp) {
+    if (!resp.length) return YES;
+    const uint8_t *b = resp.bytes;
+    if (resp.length > 2 && b[0] == 0x1f && b[1] == 0x8b) return NO;   // gzip
+    NSUInteger i = 0;
+    while (i < resp.length && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n')) i++;
+    if (i < resp.length && (b[i] == '{' || b[i] == '[')) return NO;   // JSON = 成功
+    return YES;
+}
+
+// 模板打补丁：只换展示字段，placeId / location 一个字节都不动
+static NSData *MKPatchWMTemplate(NSData *tpl) {
+    if (!tpl.length) return nil;
+    id json = [NSJSONSerialization JSONObjectWithData:tpl options:0 error:NULL];
+    if (![json isKindOfClass:[NSDictionary class]]) return nil;
+
+    __block int hits = 0;
+    __block void (^walk)(NSMutableDictionary *);
+    walk = ^(NSMutableDictionary *d) {
+        for (NSString *k in [d allKeys]) {
+            id v = d[k];
+            if ([v isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *sub = [v mutableCopy];
+                walk(sub);
+                d[k] = sub;
+                continue;
+            }
+            if (([k isEqualToString:@"name"] || [k isEqualToString:@"formattedAddress"] ||
+                 [k isEqualToString:@"addressName"] || [k isEqualToString:@"fullAddress"]) &&
+                CFG().addr.length && [v isKindOfClass:[NSString class]]) {
+                if (![v isEqualToString:CFG().addr]) { d[k] = CFG().addr; hits++; }
+            }
+        }
+    };
+
+    NSMutableDictionary *root = [json mutableCopy];
+    walk(root);
+
+    NSData *out = [NSJSONSerialization dataWithJSONObject:root options:0 error:NULL];
+    MKLog(@"[WM] template patched: %d fields -> %lu B", hits, (unsigned long)out.length);
+    return out ?: tpl;
+}
+
+// 用假响应替掉真响应：先喂 didReceiveData，再喂 didComplete(nil)，然后 return（不调原实现）
+static void MKInjectWMSuccess(id self, id session, id task, NSData *fake) {
+    SEL sData = @selector(URLSession:dataTask:didReceiveData:);
+    SEL sComp = @selector(URLSession:task:didCompleteWithError:);
+
+    IMP oData = MKSniffOrig(self, sData);
+    if (oData) ((void (*)(id, SEL, id, id, id))oData)(self, sData, session, task, fake);
+
+    IMP oComp = MKSniffOrig(self, sComp);
+    if (oComp) ((void (*)(id, SEL, id, id, id))oComp)(self, sComp, session, task, nil);
+
+    MKLog(@"[WM] injected fake success (%lu B), original suppressed", (unsigned long)fake.length);
+}
+
 // 完成：落盘 + Base64，然后调原实现
 static void h_didComplete(id self, SEL _cmd, id session, id task, NSError *error) {
     @try {
@@ -2743,11 +2895,26 @@ static void h_didComplete(id self, SEL _cmd, id session, id task, NSError *error
             [gTaskURL  removeObjectForKey:key];
             [gSniffLock unlock];
 
+            NSData *respBody = buf ?: [NSData data];
             MKDumpWatermark(u, [task originalRequest].HTTPMethod ?: @"POST",
-                            resp.allHeaderFields, body, buf ?: [NSData data],
+                            resp.allHeaderFields, body, respBody,
                             resp ? resp.statusCode : -1);
             MKClockGatePop("wm-done");          // 请求结束立刻恢复假时间
             if (error) MKLog(@"[WM] completed with error: %@", error.localizedDescription);
+
+            if (!MKIsWMFailure(respBody)) {
+                // 真成功：存成模板，供以后失败时回放
+                MKSaveWMTemplate(respBody);
+            } else if (CFG().replayWM) {
+                NSData *fake = MKPatchWMTemplate(MKLoadWMTemplate());
+                if (fake.length) {
+                    MKLog(@"[WM] server failed (%lu B) -> replay template", (unsigned long)respBody.length);
+                    MKInjectWMSuccess(self, session, task, fake);
+                    return;                     // ★ 不再调原 complete，原响应已被丢弃
+                }
+                MKLog(@"[WM] server failed (%lu B) and no template cached, pass through",
+                      (unsigned long)respBody.length);
+            }
         }
     } @catch (NSException *e) {
         MKLog(@"[WM] complete handler exception: %@", e.reason);
