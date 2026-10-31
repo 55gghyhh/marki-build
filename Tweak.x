@@ -2032,6 +2032,10 @@ static CLLocationCoordinate2D MKBD09FromWGS84(double lat, double lng) {
     return MKBD09FromGCJ02(g.latitude, g.longitude);
 }
 
+// 前置声明：doConfirm / updateCoordLabels / promptManualCoord 都在定义之前就用到它，
+// 不声明的话 clang 会当成 int 返回类型，和 CLLocationCoordinate2D 冲突。
+static CLLocationCoordinate2D MKStoreWGSForServerPoint(double plat, double plng);
+
 // 当前配置坐标的三种基准
 static CLLocationCoordinate2D MKCoordWGS84(void) { return CLLocationCoordinate2DMake(CFG().lat, CFG().lng); }
 static CLLocationCoordinate2D MKCoordGCJ02(void) { return MKGCJ02FromWGS84(CFG().lat, CFG().lng); }
@@ -2574,14 +2578,18 @@ static void MKInstallDatumHooks(void) {
     [ac addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *a) {
         NSArray *tf = ac.textFields;
-        double lat = [tf[0].text doubleValue], lng = [tf[1].text doubleValue];
+        if (tf.count < 3) return;
+        UITextField *latField  = (UITextField *)tf[0];
+        UITextField *lngField  = (UITextField *)tf[1];
+        UITextField *addrField = (UITextField *)tf[2];
+        double lat = [latField.text doubleValue], lng = [lngField.text doubleValue];
         if (fabs(lat) < 1e-6 && fabs(lng) < 1e-6) { MKAlert(@"坐标无效", @"请填真实经纬度"); return; }
         CLLocationCoordinate2D store = CFG().inverseComp
                                      ? MKStoreWGSForServerPoint(lat, lng)
                                      : CLLocationCoordinate2DMake(lat, lng);
         MKFakeCfg *cc = CFG();
         cc.lat = store.latitude; cc.lng = store.longitude;
-        if ([tf[2].text length]) cc.addr = tf[2].text;
+        if (addrField.text.length) cc.addr = addrField.text;
         cc.locOn = YES;
         [cc save];
         [weakSelf refreshStatus];
@@ -2983,13 +2991,16 @@ static NSData *MKPatchWMTemplate(NSData *tpl) {
 
     __block int hits = 0;
     __block void (^walk)(NSMutableDictionary *);
-    __block __weak void (^weakWalk)(NSMutableDictionary *);   // 弱引用版，供 block 内部递归
-    walk = weakWalk = ^(NSMutableDictionary *d) {
+    // block 里捕获 walk 会触发 -Warc-retain-cycles（只是警告，不是错误），
+    // 这个递归深度只有几层、生命周期在函数内，故意关掉这条警告。
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-retain-cycles"
+    walk = ^(NSMutableDictionary *d) {
         for (NSString *k in [d allKeys]) {
             id v = d[k];
             if ([v isKindOfClass:[NSDictionary class]]) {
                 NSMutableDictionary *sub = [v mutableCopy];
-                if (weakWalk) weakWalk(sub);
+                walk(sub);
                 d[k] = sub;
                 continue;
             }
@@ -3000,6 +3011,7 @@ static NSData *MKPatchWMTemplate(NSData *tpl) {
             }
         }
     };
+#pragma clang diagnostic pop
 
     NSMutableDictionary *root = [json mutableCopy];
     walk(root);
