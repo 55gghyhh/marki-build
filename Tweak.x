@@ -1194,17 +1194,26 @@ static BOOL MKIsEpochKey(NSString *k) {
 }
 
 // 把所有「像 epoch 的数值」换成假时间，秒/毫秒自动判断
+// 刻意写成层层嵌套的单条件 if：不用 && 串联、不用 ![..] 取反、不用 for-in 快枚举。
+// 这样任何基于正则的批量改写都不会把一个合法表达式变成无主片段。
 static BOOL MKReplaceEpochInDict(NSMutableDictionary *d) {
     BOOL hit = NO;
     long long fake = MKFakeEpoch();
-    for (NSString *k in [d allKeys]) {
+    NSArray *allKeys = [d allKeys];
+    for (NSUInteger idx = 0; idx < allKeys.count; idx++) {
+        NSString *k = (NSString *)allKeys[idx];
         id v = d[k];
-        if ([MKIsEpochKey(k)] && [v isKindOfClass:[NSNumber class]]) {
+        if ([v isKindOfClass:[NSNumber class]]) {
+            if (!MKIsEpochKey(k)) {
+                continue;
+            }
             long long n = [(NSNumber *)v longLongValue];
-            if (n > 1000000000LL && n < 10000000000LL) {          // 秒
-                d[k] = @(fake); hit = YES;
-            } else if (n > 1000000000000LL && n < 10000000000000LL) {   // 毫秒
-                d[k] = @(fake * 1000LL); hit = YES;
+            if (n > 1000000000000LL && n < 10000000000000LL) {
+                d[k] = @(fake * 1000LL);            // 毫秒
+                hit = YES;
+            } else if (n > 1000000000LL && n < 10000000000LL) {
+                d[k] = @(fake);                     // 秒
+                hit = YES;
             }
         } else if ([v isKindOfClass:[NSDictionary class]]) {
             NSMutableDictionary *sub = [v mutableCopy];
