@@ -107,7 +107,10 @@ static void MKLog(NSString *fmt, ...) {
 @property (nonatomic, assign) BOOL      safeClockOn;
 @property (nonatomic, assign) BOOL      renderOnly;        // 只改渲染层：网络/定位/时间全部真实
 @property (nonatomic, assign) BOOL      replayWM;          // 服务端失败时用模板回放一个成功响应
-@property (nonatomic, assign) BOOL      inverseComp;       // 反向补偿：让服务端解析到我们要的 POI（推荐开）          // 服务端失败时用模板回放一个成功响应
+@property (nonatomic, assign) BOOL      inverseComp;
+@property (nonatomic, assign) BOOL      stealth;           // 合法通道模式：网络全真，只伪造本地
+@property (nonatomic, assign) BOOL      ntpFree;
+@property (nonatomic, assign) BOOL      rewriteVerifyBody;  // 改写 syncPersonMom 请求体里的时间/地址           // 解除 NTP 时间硬阻断       // 反向补偿：让服务端解析到我们要的 POI（推荐开）          // 服务端失败时用模板回放一个成功响应
 @property (nonatomic, assign) NSInteger clockScope;       // 0=关 1=只GPUMarkSDK(安全,默认) 2=白名单全开
 @property (nonatomic, assign) BOOL      verifyOn;          // 验真对齐总开关
 @property (nonatomic, copy)   NSString *verifyExifText;    // 注入的 ImageDescription/Caption，留空=抄真图
@@ -135,6 +138,9 @@ static void MKLog(NSString *fmt, ...) {
         _timeMode = 0;
         _replayWM = YES;
         _inverseComp = YES;
+        _stealth = YES;
+        _ntpFree = YES;
+        _rewriteVerifyBody = YES;
         _clockScope = 1;
         _verifyOn = YES;
         _verifyExifText = @"";
@@ -161,6 +167,9 @@ static void MKLog(NSString *fmt, ...) {
     if ([d objectForKey:@"mk.timeMode"])   self.timeMode = [d integerForKey:@"mk.timeMode"];
     if ([d objectForKey:@"mk.replayWM"])   self.replayWM = [d boolForKey:@"mk.replayWM"];
     if ([d objectForKey:@"mk.inverseComp"]) self.inverseComp = [d boolForKey:@"mk.inverseComp"];
+    if ([d objectForKey:@"mk.stealth"])    self.stealth = [d boolForKey:@"mk.stealth"];
+    if ([d objectForKey:@"mk.ntpFree"])    self.ntpFree = [d boolForKey:@"mk.ntpFree"];
+    if ([d objectForKey:@"mk.rewriteVerifyBody"]) self.rewriteVerifyBody = [d boolForKey:@"mk.rewriteVerifyBody"];
     if ([d objectForKey:@"mk.clockScope"]) self.clockScope = [d integerForKey:@"mk.clockScope"];
     if ([d objectForKey:@"mk.verifyOn"])  self.verifyOn = [d boolForKey:@"mk.verifyOn"];
     if ([d stringForKey:@"mk.verifyExif"]) self.verifyExifText = [d stringForKey:@"mk.verifyExif"];
@@ -201,6 +210,9 @@ static void MKLog(NSString *fmt, ...) {
     self.timeOn = (self.timeMode != 0);
     [d setBool:self.replayWM   forKey:@"mk.replayWM"];
     [d setBool:self.inverseComp forKey:@"mk.inverseComp"];
+    [d setBool:self.stealth forKey:@"mk.stealth"];
+    [d setBool:self.ntpFree forKey:@"mk.ntpFree"];
+    [d setBool:self.rewriteVerifyBody forKey:@"mk.rewriteVerifyBody"];
     [d setInteger:self.clockScope forKey:@"mk.clockScope"];
     [d setBool:self.verifyOn forKey:@"mk.verifyOn"];
     [d setObject:self.verifyExifText ?: @"" forKey:@"mk.verifyExif"];
@@ -442,6 +454,7 @@ static BOOL MKSafeStringKey(Class cls, id model, NSString *key) {
 
 static void MKSpoofModel(id model) {
     if (!model || !CFG().locOn || CFG().renderOnly) return;
+    // stealth：只钉经纬度（驱动网络请求坐标），地址交给服务端 placeId
     Class cls = object_getClass(model);
 
     // 经纬度：写不进去就说明这不是定位模型，直接收手
@@ -491,6 +504,37 @@ static double h_objLng(id self, SEL _cmd) { return (CFG().locOn && !CFG().render
 static id h_locMgrLocation(id self, SEL _cmd) { if (CFG().locOn && !CFG().renderOnly) { CLLocation *f = MKFakeLocation(); if (f) return f; } return ((id (*)(id, SEL))o_locMgrLocation)(self, _cmd); }
 static CLLocationCoordinate2D h_locCoord(id self, SEL _cmd) { if (CFG().locOn && !CFG().renderOnly) return CLLocationCoordinate2DMake(CFG().lat, CFG().lng); return ((CLLocationCoordinate2D (*)(id, SEL))o_locCoord)(self, _cmd); }
 static id h_locSource(id self, SEL _cmd) { if (CFG().antiOn && CFG().locOn) return nil; return ((id (*)(id, SEL))o_locSource)(self, _cmd); }
+// ---------------------------------------------------------------------------
+//  定位：合法通道
+//
+//  App 的取值优先级（上一轮逆向，LocationAdjustManager @0x100805ee0）：
+//      手动微调 > 团队常用 > 个人常用 > 自动 GPS
+//      严格水印：手动偏移 > 200 m 才降级；非严格：> 1000 m；缓存复用 < 50 m
+//      三个阈值都在 __TEXT,__const 里（200.0 / 1000.0 / 50.0）
+//
+//  所以「跨城」不需要绕阈值——只要让 GPS 本身就等于目标点：
+//    distance(手动, GPS) = 0 → 所有档位天然通过，不需要改网络参数、不需要改阈值。
+//  这正是「合法通道注入」：App 自己认为你就在那儿，请求里的坐标和签名全部真实。
+//
+//  下面这个 hook 只做观测，把 App 最终选了哪条分支打出来，便于核对。
+// ---------------------------------------------------------------------------
+static IMP o_adjManualUpdate = NULL;
+
+static void h_adjManualUpdate(id self, SEL _cmd, id note) {
+    @try {
+        MKLog(@"[Loc] adjust branch: target=(%.6f,%.6f) addr=%@ strict/level=%ld",
+              CFG().lat, CFG().lng, CFG().addr, (long)CFG().clockScope);
+    } @catch (NSException *e) {}
+    if (o_adjManualUpdate) ((void (*)(id, SEL, id))o_adjManualUpdate)(self, _cmd, note);
+}
+
+static void MKInstallLocBranchProbe(void) {
+    Class c = objc_getClass("_TtC8marki_cn21LocationAdjustManager");
+    if (!c) { MKLog(@"· LocationAdjustManager 不存在"); return; }
+    o_adjManualUpdate = MKHook(c, NSSelectorFromString(@"locationManualUpdateWithNotification:"),
+                               (IMP)h_adjManualUpdate, "Loc_AdjustBranch");
+}
+
 static void MKHookDoubleGetter(Class cls, SEL sel, IMP fn, IMP *slot, const char *label) {
     if (!cls) return; Method m = class_getInstanceMethod(cls, sel); if (!m) return; if (MKRetType(m) != 'd') return; *slot = MKHook(cls, sel, fn, label);
 }
@@ -507,15 +551,15 @@ static void MKHookStringGetter(Class cls, SEL sel, IMP fn, IMP *slot, const char
 static IMP o_infoAddr = NULL, o_objAddr = NULL, o_objNowAddr = NULL;
 
 static id h_infoAddr(id self, SEL _cmd) {
-    if (CFG().locOn && !CFG().renderOnly && CFG().addr.length) return CFG().addr;
+    if (CFG().locOn && !CFG().renderOnly && !CFG().stealth && CFG().addr.length) return CFG().addr;
     return o_infoAddr ? ((id (*)(id, SEL))o_infoAddr)(self, _cmd) : nil;
 }
 static id h_objAddr(id self, SEL _cmd) {
-    if (CFG().locOn && !CFG().renderOnly && CFG().addr.length) return CFG().addr;
+    if (CFG().locOn && !CFG().renderOnly && !CFG().stealth && CFG().addr.length) return CFG().addr;
     return o_objAddr ? ((id (*)(id, SEL))o_objAddr)(self, _cmd) : nil;
 }
 static id h_objNowAddr(id self, SEL _cmd) {
-    if (CFG().locOn && !CFG().renderOnly && CFG().addr.length) return CFG().addr;
+    if (CFG().locOn && !CFG().renderOnly && !CFG().stealth && CFG().addr.length) return CFG().addr;
     return o_objNowAddr ? ((id (*)(id, SEL))o_objNowAddr)(self, _cmd) : nil;
 }
 
@@ -568,6 +612,7 @@ static void MKInstallLocationHooks(void) {
     o_locMgrLocation = MKHook(objc_getClass("CLLocationManager"), @selector(location), (IMP)h_locMgrLocation, "Loc_Mgr_Loc");
     o_locCoord = MKHook(objc_getClass("CLLocation"), @selector(coordinate), (IMP)h_locCoord, "Loc_Coord");
     o_locSource = MKHook(objc_getClass("CLLocation"), @selector(sourceInformation), (IMP)h_locSource, "Loc_Source");
+    MKInstallLocBranchProbe();
 }
 
 static IMP o_simSoftware = NULL, o_bmkMockProb = NULL, o_bmkMgrMockProb = NULL, o_tnkMockGPS = NULL, o_bizMockLimit = NULL, o_realIsMock = NULL, o_distance = NULL;
@@ -589,39 +634,23 @@ static void MKInstallAntiCheatHooks(void) {
 }
 
 static NSDate *MKParseFakeTime(NSString *s);
-static volatile int  gTimeDelta = 0;
+
+// ============================================================================
+//  C 层时钟劫持已彻底移除
+//
+//  曾经改写 time() / gettimeofday() / clock_gettime() / CFAbsoluteTimeGetCurrent()。
+//  后果（实测）：NTP 判定必然报"修改过手机时间"、SSL 证书链的 validFrom/validTo
+//  校验失败、各 SDK 心跳超时 → 闪退。跨城跨年时偏移动辄几十天，这条路根本走不通。
+//
+//  现在时间只做两件事：
+//    ① Hook -[MKNtpManager hasLocalTimeBeenModified] 让它返回 NO（解除硬阻断）
+//    ② 网络请求一律用真实物理时间（sign 天然正确）
+//    ③ 假时间只出现在「水印文字」和「verificationInfo」里
+//  下面三个变量保留只为兼容既有代码路径，恒为未激活。
+// ============================================================================
+static volatile int  gTimeDelta   = 0;
 static BOOL          gClockHooked = NO;
 static volatile BOOL gClockActive = NO;
-
-static time_t (*gOrigTime)(time_t *) = NULL;
-static int    (*gOrigGettimeofday)(struct timeval *, void *) = NULL;
-static int    (*gOrigClockGettime)(clockid_t, struct timespec *) = NULL;
-// CFAbsoluteTime 是 CoreFoundation 的时间基准（2001 起算），NSDate/CFDate 都走它。
-// 一起改掉，才算真正「底层」——只改 time() 会漏掉所有走 CF 的路径。
-static double (*gOrigCFAbsolute)(void) = NULL;
-
-static double MK_CFAbsoluteTimeGetCurrent(void) {
-    double v = gOrigCFAbsolute ? gOrigCFAbsolute() : 0.0;
-    if (gClockActive) v += (double)gTimeDelta;
-    return v;
-}
-
-static time_t MK_time(time_t *out) {
-    time_t v = gOrigTime ? gOrigTime(out) : 0;
-    if (gClockActive) v += (time_t)gTimeDelta;
-    if (out) *out = v;
-    return v;
-}
-static int MK_gettimeofday(struct timeval *tv, void *tz) {
-    int rc = gOrigGettimeofday ? gOrigGettimeofday(tv, tz) : -1;
-    if (rc == 0 && tv && gClockActive) tv->tv_sec += gTimeDelta;
-    return rc;
-}
-static int MK_clock_gettime(clockid_t cid, struct timespec *ts) {
-    int rc = gOrigClockGettime ? gOrigClockGettime(cid, ts) : -1;
-    if (rc == 0 && ts && cid == CLOCK_REALTIME && gClockActive) ts->tv_sec += gTimeDelta;
-    return rc;
-}
 
 #ifndef INDIRECT_SYMBOL_LOCAL
 #define INDIRECT_SYMBOL_LOCAL 0x80000000
@@ -881,37 +910,11 @@ static int MKRebindAllImages(MKHookEntry *tab, int tabCount, const char *tag,
 }
 
 static BOOL MKApplyClockHook(void) {
-    if (gClockHooked) return YES;
-
-    // 每次安装前从配置刷新作用域
-    gClockScope   = (int)CFG().clockScope;
-    gAllowLazyPtr = (gClockScope >= 2);
-    MKLog(@"CLOCK fishhook: scope=%d (1=GPUMarkSDK only, 2=all whitelisted) lazyInGPUMark=YES",
-          gClockScope);
-
-    if (!gOrigTime || !gOrigGettimeofday || !gOrigClockGettime) {
-        gOrigTime          = (time_t (*)(time_t *))dlsym(RTLD_DEFAULT, "time");
-        gOrigGettimeofday  = (int (*)(struct timeval *, void *))dlsym(RTLD_DEFAULT, "gettimeofday");
-        gOrigClockGettime  = (int (*)(clockid_t, struct timespec *))dlsym(RTLD_DEFAULT, "clock_gettime");
-    }
-    if (!gOrigTime || !gOrigGettimeofday || !gOrigClockGettime) {
-        MKLog(@"✗ 时钟 fishhook：dlsym 拿不到真身，放弃（绝不用 stub 地址当原函数）");
-        return NO;
-    }
-    if (!gOrigCFAbsolute) {
-        gOrigCFAbsolute = (double (*)(void))dlsym(RTLD_DEFAULT, "CFAbsoluteTimeGetCurrent");
-    }
-
-    MKHookEntry tab[4] = {
-        { "_time",                     (void *)MK_time,       (void **)&gOrigTime,         MK_GROUP_CLOCK },
-        { "_gettimeofday",             (void *)MK_gettimeofday,(void **)&gOrigGettimeofday, MK_GROUP_CLOCK },
-        { "_clock_gettime",            (void *)MK_clock_gettime,(void **)&gOrigClockGettime, MK_GROUP_CLOCK },
-        { "_CFAbsoluteTimeGetCurrent", (void *)MK_CFAbsoluteTimeGetCurrent,
-                                       (void **)&gOrigCFAbsolute, MK_GROUP_CLOCK },
-    };
-    int total = MKRebindAllImages(tab, 4, "CLOCK", NO, NO);
-    gClockHooked = (total > 0);
-    return gClockHooked;
+    // 永久停用：C 层时钟一改，NTP / 证书 / 心跳全崩，且毫无必要（时间只需在渲染层伪造）
+    MKLog(@"CLOCK hook disabled by design (C-layer time is never touched)");
+    gClockHooked = NO;
+    gClockActive = NO;
+    return NO;
 }
 
 // 只还原指定 group 的记录，其余保留
@@ -940,7 +943,7 @@ static void MKRecomputeTimeDelta(void) {
     MKFakeCfg *c = CFG();
     NSDate *fake = MKParseFakeTime(c.fakeTime);
     if (!fake) { gTimeDelta = 0; gClockActive = NO; return; }
-    time_t real = gOrigTime ? gOrigTime(NULL) : (time_t)[[NSDate date] timeIntervalSince1970];
+    time_t real = (time_t)[[NSDate date] timeIntervalSince1970];   // 真实时间，只用于算展示差
     gTimeDelta = (int)llround([fake timeIntervalSince1970] - (double)real);
     gClockActive = (c.timeMode == 2 && c.safeClockOn && gClockHooked);
     MKLog(@"时钟 delta=%d 秒 (%.1f 天) active=%d (timeMode=%ld safeClock=%d hooked=%d)",
@@ -958,79 +961,21 @@ static void MKRecomputeTimeDelta(void) {
 static volatile int gClockGate = 0;
 
 static void MKClockGatePush(const char *tag) {
-    gClockGate++;
-    gClockActive = NO;                 // MK_time 是纯算术，读 volatile 立即生效
-    MKLog(@"[ClockGate] PUSH(%s) depth=%d active=0 (real time)", tag, gClockGate);
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (gClockGate > 0) {
-            MKLog(@"[ClockGate] watchdog fire, force reset depth=%d", gClockGate);
-            gClockGate = 0;
-            MKFakeCfg *c = CFG();
-            gClockActive = (c.timeMode == 2 && c.safeClockOn && gClockHooked);
-            MKLog(@"[ClockGate] restored active=%d", (int)gClockActive);
-        }
-    });
+    // 不再需要：底层时钟已不劫持，网络请求本来就跑在真实时间上
+    (void)tag;
 }
-
 static void MKClockGatePop(const char *tag) {
-    if (gClockGate > 0) gClockGate--;
-    if (gClockGate == 0) {
-        MKFakeCfg *c = CFG();
-        gClockActive = (c.timeMode == 2 && c.safeClockOn && gClockHooked);
-        MKLog(@"[ClockGate] POP(%s) depth=0 active=%d", tag, (int)gClockActive);
-    } else {
-        MKLog(@"[ClockGate] POP(%s) depth=%d", tag, gClockGate);
-    }
+    (void)tag;
 }
 
-static void MKSetSafeClock(BOOL on) {
-    MKFakeCfg *c = CFG();
-    c.safeClockOn = on;
-    if (on) {
-        BOOL ok = MKApplyClockHook();
-        if (!ok) {
-            MKAlert(@"时钟 Hook 失败", @"当前设备未命中 __got 槽位（arm64e 认证指针）。\n定位/相册/时间格式化仍可用，只有水印底层时间不会变。");
-        }
-    } else {
-        MKRevertClockHook();
-    }
-    [c save];
-    MKRecomputeTimeDelta();
-}
-
-// 安全模式：0=关 1=只 GPUMarkSDK（默认/推荐） 2=白名单全开
+// C 层时钟已停用，这里保留空实现只为兼容旧调用点
 static void MKSetClockScope(int scope) {
-    MKFakeCfg *c = CFG();
-    if (scope < 0) scope = 0;
-    if (scope > 2) scope = 2;
-
-    // 先整体还原，再按新作用域重装，避免旧槽位残留
-    MKRevertClockHook();
-
-    c.clockScope = scope;
-    c.safeClockOn = (scope > 0);
-    gClockScope = scope;
-    gAllowLazyPtr = (scope >= 2);
-
-    if (scope == 0) {
-        [c save];
-        MKRecomputeTimeDelta();
-        MKLog(@"底层时钟：已关闭");
-        return;
-    }
-
-    BOOL ok = MKApplyClockHook();
-    [c save];
-    MKRecomputeTimeDelta();
-    MKLog(@"底层时钟：scope=%d 安装%s", scope, ok ? "OK" : "FAIL(no slot)");
-    if (!ok) {
-        MKAlert(@"时钟 Hook 未命中",
-                scope == 1
-                  ? @"GPUMarkSDK 里没有可改写的 __got 槽位。可切到「全开」再试，但风险更高。"
-                  : @"所有白名单镜像都没命中 __got。此设备/此版本可能不支持底层时钟。");
-    }
+    MKLog(@"MKSetClockScope(%d) ignored: C-layer clock hook removed", scope);
+    CFG().clockScope = 0;
+    CFG().safeClockOn = NO;
+    gClockScope = 0;
+    gClockActive = NO;
+    gClockHooked = NO;
 }
 
 static IMP o_stringFromDate = NULL, o_dateNow = NULL, o_dateNowClass = NULL;
@@ -1054,12 +999,41 @@ static void MKRefreshFakeDate(void) {
     MKLog(@"假时间 \"%@\" → NSDate=%@", CFG().fakeTime, gFakeDate);
     MKRecomputeTimeDelta();
 }
-// 只有「底层时钟」模式才动 NSDateFormatter；渲染模式必须让网络/签名拿真时间
+// 时间模式：C 层时钟已彻底移除，只剩「关」和「仅渲染层」
 #define MK_TIME_OFF     0
 #define MK_TIME_RENDER  1
-#define MK_TIME_BOTTOM  2
+#define MK_TIME_BOTTOM  2      // 遗留值，等同 RENDER（绝不碰底层）
 
-static BOOL MKTimeBottom(void) { return (CFG().timeMode == MK_TIME_BOTTOM); }
+static BOOL MKTimeBottom(void) {
+    // 永不为真：任何 NSDate/NSDateFormatter 的改写都会污染 sign 和证书校验
+    return NO;
+}
+static BOOL MKTimeSpoofOn(void) { return (CFG().timeMode != MK_TIME_OFF); }
+
+// ---------------------------------------------------------------------------
+//  NTP 判定：App 用「网络时间 vs 手机时间」做硬阻断。
+//  -[MKNtpManager hasLocalTimeBeenModified] @ 0x100a85e74 (上一轮逆向确认)
+//  返回 YES 时：无法同步照片 / 无法修改定位 / 无法查看团队数据 —— 全被掐。
+//  这里只接管这一步「判定结果」，不动任何时间源，所以 NTP 报文和证书都正常。
+// ---------------------------------------------------------------------------
+static IMP o_ntpModified = NULL;
+
+static BOOL h_ntpModified(id self, SEL _cmd) {
+    if (CFG().ntpFree) {
+        MKLOG_ONCE(@"NTP hasLocalTimeBeenModified -> NO (硬阻断已解除)");
+        return NO;
+    }
+    return o_ntpModified ? ((BOOL (*)(id, SEL))o_ntpModified)(self, _cmd) : NO;
+}
+
+static void MKInstallNtpHook(void) {
+    Class c = objc_getClass("_TtC8marki_cn12MKNtpManager");
+    if (!c) { MKLog(@"· MKNtpManager 不存在，NTP 判定 hook 跳过"); return; }
+    Method m = class_getInstanceMethod(c, NSSelectorFromString(@"hasLocalTimeBeenModified"));
+    if (!m) { MKLog(@"· hasLocalTimeBeenModified 不存在"); return; }
+    o_ntpModified = MKHook(c, NSSelectorFromString(@"hasLocalTimeBeenModified"),
+                           (IMP)h_ntpModified, "NTP_hasLocalTimeBeenModified");
+}
 
 static id h_stringFromDate(id self, SEL _cmd, NSDate *date) {
     if (!MKTimeBottom() || !gFakeDate)
@@ -1075,6 +1049,7 @@ static id h_dateDate(id self, SEL _cmd) {
     return [real dateByAddingTimeInterval:(NSTimeInterval)gTimeDelta];
 }
 static void MKInstallTimeHooks(void) {
+    MKInstallNtpHook();          // 只接管「判定结果」，不动时间源
     MKRefreshFakeDate();
     o_stringFromDate = MKHook(objc_getClass("NSDateFormatter"), @selector(stringFromDate:), (IMP)h_stringFromDate, "Time_Formatter");
     o_dateNow = MKHookClass(objc_getClass("NSDate"), @selector(now), (IMP)h_dateNow, "Time_Now");
@@ -1257,7 +1232,7 @@ static id MKRewriteWatermarkText(id content, int itemId, const char *src) {
         hasDate = YES;
     }
 
-    if (hasDate && c.timeMode == MK_TIME_RENDER) {
+    if (hasDate && MKTimeSpoofOn()) {
         out = MKReplaceDateTime(s);
         why = @"time";
     } else if (!hasDate && c.locOn && MKLooksLikeAddress(s)) {
@@ -1582,7 +1557,7 @@ static IMP MKRegeoOrig(id obj, SEL sel) {
 }
 #define MK_RG_GETTER(fn, expr) \
     static id fn(id s_, SEL c) { \
-        if (CFG().locOn && !CFG().renderOnly) return (expr); \
+        if (CFG().locOn && !CFG().renderOnly && !CFG().stealth) return (expr); \
         IMP o = MKRegeoOrig(s_, c); \
         return o ? ((id (*)(id, SEL))o)(s_, c) : nil; \
     }
@@ -1598,7 +1573,7 @@ MK_RG_GETTER(mk_rgStreetNum, @"")
 MK_RG_GETTER(mk_rgPoiName,   CFG().addr)
 
 static BOOL mk_rgValid(id s_, SEL c) {
-    if (CFG().locOn && !CFG().renderOnly) return YES;
+    if (CFG().locOn && !CFG().renderOnly && !CFG().stealth) return YES;
     IMP o = MKRegeoOrig(s_, c);
     return o ? ((BOOL (*)(id, SEL))o)(s_, c) : NO;
 }
@@ -1656,7 +1631,7 @@ static void MKForceRegeocodeClass(const char *clsName, const char *tag) {
 static IMP o_reverseGeo = NULL;
 
 static void mk_reverseGeo(id self, SEL _cmd, CLLocation *loc, id handler) {
-    if (CFG().locOn && !CFG().renderOnly && loc && handler) {
+    if (CFG().locOn && !CFG().renderOnly && !CFG().stealth && loc && handler) {
         CLLocationCoordinate2D c = loc.coordinate;
         double dLat = fabs(c.latitude  - CFG().lat);
         double dLng = fabs(c.longitude - CFG().lng);
@@ -1774,7 +1749,8 @@ static id gBlindHash = nil;
 
 static id mk_bwExtract(id self, SEL _cmd, id img) {
     // 渲染层模式：哈希必须来自当前这张图，绝不能用「上次学到的」张冠李戴
-    if (CFG().renderOnly) {
+    if (CFG().renderOnly || CFG().stealth) {
+        // stealth：哈希必须逐图现算，绝不复用别的图的（复用会让服务端判定图被换过）
         id rr = ((id (*)(id, SEL, id))o_bwExtract)(self, _cmd, img);
         if (rr && ![rr isKindOfClass:[NSNull class]]) gBlindHash = rr;
         return rr;
@@ -1818,7 +1794,8 @@ static void MKInstallVerifyHooks(void) {
 
     // ③ EXIF 注入（走 fishhook，改 marki_cn 的 __got 槽位）
     // 渲染层模式下必须关掉：EXIF 被改会进 78 B 请求体，服务端一比对就 unauthorized
-    gVerifyExifOn = CFG().verifyOn && !CFG().renderOnly;
+    // stealth：EXIF 会进 78 B 请求体，一改服务端就 unauthorized
+    gVerifyExifOn = CFG().verifyOn && !CFG().renderOnly && !CFG().stealth;
     if (gVerifyExifOn) {
         if (!gOrigCGISProps) {
             gOrigCGISProps = (CFDictionaryRef (*)(CGImageSourceRef, size_t, CFDictionaryRef))
@@ -2329,10 +2306,13 @@ static void MKInstallDatumHooks(void) {
     [self.switches[0] setOn:c.locOn animated:NO]; [self.switches[1] setOn:c.timeOn animated:NO]; [self.switches[2] setOn:c.wxOn animated:NO]; [self.switches[3] setOn:c.photoOn animated:NO]; [self.switches[4] setOn:c.safeClockOn animated:NO]; [self.switches[5] setOn:c.adBlockOn animated:NO]; [self.switches[6] setOn:c.antiOn animated:NO];
     NSString *(^Y)(BOOL) = ^NSString *(BOOL on) { return on ? @"开" : @"关"; };
     NSString *tMode = @"关";
-    if (c.timeMode == MK_TIME_BOTTOM)      tMode = gClockHooked ? (gClockActive ? @"底层✓" : @"底层(未激活)") : @"底层✗未挂上";
-    else if (c.timeMode == MK_TIME_RENDER) tMode = @"仅水印";
-    NSString *clock = (c.clockScope == 0 ? @"关" : (gClockHooked ? @"已挂" : @"失败"));
-    self.statusLabel.text = [NSString stringWithFormat:@"%@\n定位：%@  时间：%@  替拍：%@\n天气：%@  反作弊：%@\nC层时钟：%@  广告：%@", (c.renderOnly ? @"【渲染层】网络全真实" : @"【全伪造】"), Y(c.locOn), tMode, Y(c.photoOn), Y(c.wxOn), Y(c.antiOn), clock, c.adBlockOn ? (gAdBlockActive ? @"拦" : @"待注册") : @"关"];
+    if (c.timeMode == MK_TIME_RENDER) tMode = @"仅水印";
+    else if (c.timeMode != MK_TIME_OFF) tMode = @"仅水印";      // 遗留值一律按渲染层处理
+    NSString *modeTag = c.stealth ? @"【合法通道】网络全真" : @"【全伪造】";
+    self.statusLabel.text = [NSString stringWithFormat:
+        @"%@\n定位：%@  时间：%@  替拍：%@\n天气：%@  反作弊：%@\nNTP阻断：%@  时钟：已停用",
+        modeTag, Y(c.locOn), tMode, Y(c.photoOn), Y(c.wxOn), Y(c.antiOn),
+        c.ntpFree ? @"已解除" : @"生效中"];
     NSString *img = c.imgPath.length ? c.imgPath : @"@latest"; if (img.length > 28) img = [img substringFromIndex:img.length - 28];
     CLLocationCoordinate2D g2 = MKGCJ02FromWGS84(c.lat, c.lng);
     CLLocationCoordinate2D b2 = MKBD09FromWGS84(c.lat, c.lng);
@@ -2344,20 +2324,17 @@ static void MKInstallDatumHooks(void) {
     switch (idx) {
         case 0: c.locOn = on; gFakeLoc = nil; gFakeLat = -9999; gFakeLng = -9999; break;
         case 1:
-            // 时间开关：开=底层时钟（改 C 层 time/CFAbsoluteTime），关=完全不动
-            c.timeMode = on ? MK_TIME_BOTTOM : MK_TIME_OFF;
+            // 时间开关：只在水印渲染层替换，底层与网络一律真实
+            c.timeMode = on ? MK_TIME_RENDER : MK_TIME_OFF;
             c.timeOn = on;
-            if (on) {
-                if (gClockHooked) { MKSetClockScope(2); }
-                else { c.safeClockOn = YES; MKSetClockScope(2); }
-            } else {
-                MKRevertClockHook();
-            }
+            c.safeClockOn = NO;
+            c.clockScope = 0;
+            if (on) c.ntpFree = YES;
             MKRefreshFakeDate();
             break;
         case 2: c.wxOn = on; break;
         case 3: c.photoOn = on; if (on) { c.photoAlways = NO; c.photoUntil = MKUnixNow() + 600; MKPrefetchSwapImage(); } break;
-        case 4: @try { MKSetSafeClock(on); } @catch (NSException *e) {} break;
+        case 4: c.ntpFree = on; [c save]; MKLog(@"ntpFree=%d", (int)on); break;   // NTP 阻断开关
         case 5: c.adBlockOn = on; if (on) { MKInstallDeferredHooks(); MKInstallAdBlock(); if (!gAdBlockActive) MKAlert(@"去广告未生效", @"注册失败，可能是网络栈已固化 protocolClasses。重启 App 后自动重试。"); } else { MKAlert(@"去广告已关闭", @"已注册的 Protocol 无法反注册，重启 App 后彻底停用。"); } break;
         case 6: c.antiOn = on; break;
     }
@@ -2508,20 +2485,48 @@ static void MKInstallDatumHooks(void) {
         PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:conf]; pk.delegate = self;
         [self presentViewController:pk animated:YES completion:nil]; return;
     }
-    if (idx == 4) {                       // 底层时钟：安全模式选择
+    if (idx == 4) {                       // 风控开关（一律不碰底层）
         UIAlertController *ac = [UIAlertController
-            alertControllerWithTitle:@"底层时钟"
-                             message:@"改的是 C 层 time()。开全量改写会波及网络签名，只在需要水印时间时才开。"
+            alertControllerWithTitle:@"风控开关"
+                             message:@"底层时间与网络参数一律不动，只调整 App 内部判定结果。"
                       preferredStyle:UIAlertControllerStyleActionSheet];
         __weak typeof(self) weakSelf = self;
 
-        [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            MKSetClockScope(0); [weakSelf refreshStatus]; MKSnack(@"底层时钟已关");
+        [ac addAction:[UIAlertAction actionWithTitle:(c.ntpFree ? @"✓ 已解除 NTP 时间阻断" : @"解除 NTP 时间阻断")
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            MKFakeCfg *cc = CFG();
+            cc.ntpFree = !cc.ntpFree;
+            [cc save];
+            [weakSelf refreshStatus];
+            MKSnack(cc.ntpFree ? @"NTP 阻断已解除" : @"NTP 阻断已恢复");
         }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"全开" style:UIAlertActionStyleDestructive
-                                            handler:^(UIAlertAction *a) {
-            MKSetClockScope(2); [weakSelf refreshStatus]; MKSnack(@"底层时钟已全开");
+        [ac addAction:[UIAlertAction actionWithTitle:(c.stealth ? @"✓ 合法通道模式（网络全真）" : @"开启合法通道模式")
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            MKFakeCfg *cc = CFG();
+            cc.stealth = !cc.stealth;
+            [cc save];
+            [weakSelf refreshStatus];
+            MKSnack(cc.stealth ? @"已开启：只伪造本地，网络全真" : @"已关闭");
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:(c.rewriteVerifyBody ? @"✓ 改写验真上报体" : @"改写验真上报体")
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            MKFakeCfg *cc = CFG();
+            cc.rewriteVerifyBody = !cc.rewriteVerifyBody;
+            [cc save];
+            [weakSelf refreshStatus];
+            MKSnack(cc.rewriteVerifyBody ? @"上报体已改写" : @"上报体透传");
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"查看当前状态"
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            MKFakeCfg *cc = CFG();
+            MKAlert(@"当前状态", [NSString stringWithFormat:
+                @"NTP 阻断解除：%@\n合法通道模式：%@\n时间模式：%ld（1=仅渲染）\nC 层时钟：已永久停用\n定位注入：%@ (%.6f, %.6f)\nNTP hook：%@",
+                cc.ntpFree ? @"是" : @"否", cc.stealth ? @"是" : @"否", (long)cc.timeMode,
+                cc.locOn ? @"开" : @"关", cc.lat, cc.lng, o_ntpModified ? @"已挂" : @"未挂"]);
         }]];
         [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
@@ -2682,6 +2687,8 @@ static void MKShowPanel(void) {
 // 前向声明：协议里用到，定义在本段之后
 static BOOL MKIsGeoURL(NSURL *url);
 static NSData *MKRewriteGeoData(NSData *data, NSURL *url);
+static BOOL MKIsVerifyRecordURL(NSURL *url);
+static id MKRewriteWatermarkText(id content, int itemId, const char *src);
 
 // ============================================================================
 //  统一网络劫持协议
@@ -2715,6 +2722,8 @@ static NSData *MKRewriteGeoData(NSData *data, NSURL *url);
     // getNewWatermark 不再走本协议：它必须原封不动地由 App 自己发出去。
     // 上一版用新 session 转发 → 服务端返回 0 字节 → 防伪码没有服务端记录。
     if (MKIsGeoURL(request.URL))          return YES;      // 地理接口改写（明文 JSON，安全）
+    // 验真登记：只改 body，不动 query（sign 在 query 上，不受影响）
+    if (CFG().rewriteVerifyBody && MKIsVerifyRecordURL(request.URL)) return YES;
     if (gAdBlockActive && [NSURLProtocol propertyForKey:@"MKAdBlocked" inRequest:request] == nil) {
         NSString *s = request.URL.absoluteString.lowercaseString;
         for (NSString *k in [self mk_adKeywords]) if ([s containsString:k]) return YES;
@@ -2812,6 +2821,122 @@ static NSString *MKPreview(NSData *d, NSUInteger maxLen) {
 }
 
 // 防伪码取证（delegate 层）：请求体 + 完整响应体落盘 + Base64
+// ============================================================================
+//  验真上报体改写（最后一块拼图）
+//
+//  链路（上一轮逆向确认）：
+//    成图 → 传 OSS 拿 url → VerificationManager.sendToVerificationRecord
+//         → 组 verificationInfo（含 watermarkMeta 的 key 列表）
+//         → POST /mkg/MomentInfo/syncPersonMom
+//  服务端只做登记、原样回显，所以「扫码看什么」完全取决这一步发出去的内容。
+//
+//  sign 只覆盖 URL query（见 sign= 在 query 里的位置），body 是独立的，
+//  所以改 body 不会破坏验签 —— 但仍要先验证：如果改完服务端返非 0，说明
+//  body 也参与签名，那就把 rewriteVerifyBody 关掉，只留日志。
+// ============================================================================
+
+static BOOL MKIsVerifyRecordURL(NSURL *url) {
+    if (!url) return NO;
+    NSString *s = url.absoluteString;
+    return [s containsString:@"syncPersonMom"];
+}
+
+// 读 body（HTTPBody 优先，其次 HTTPBodyStream），并回填
+static NSData *MKReadRequestBody(NSMutableURLRequest *req) {
+    if (req.HTTPBody) return req.HTTPBody;
+    NSInputStream *st = req.HTTPBodyStream;
+    if (!st) return nil;
+    @try {
+        [st open];
+        NSMutableData *out = [NSMutableData data];
+        uint8_t buf[4096];
+        NSInteger n = 0;
+        while ((n = [st read:buf maxLength:sizeof(buf)]) > 0)
+            [out appendBytes:buf length:(NSUInteger)n];
+        [st close];
+        if (out.length) {
+            req.HTTPBody = out;
+            [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)out.length]
+                forHTTPHeaderField:@"Content-Length"];
+        }
+        return out.length ? out : nil;
+    } @catch (NSException *e) {
+        MKLog(@"[VB] read body failed: %@", e.reason);
+        return nil;
+    }
+}
+
+static NSString *MKHexDump(NSData *d, NSUInteger maxBytes) {
+    if (!d.length) return @"(empty)";
+    NSUInteger n = MIN(d.length, maxBytes);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:n*2];
+    const uint8_t *b = d.bytes;
+    for (NSUInteger i = 0; i < n; i++) [hex appendFormat:@"%02x", b[i]];
+    if (d.length > n) [hex appendFormat:@"...(total %lu B)", (unsigned long)d.length];
+    return hex;
+}
+
+// 递归改写 JSON 里的字符串值（时间片段 / 地址串）
+static id MKRewriteJSONTree(id obj, int *hits) {
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:[(NSDictionary *)obj count]];
+        for (id k in (NSDictionary *)obj) {
+            id v = [(NSDictionary *)obj objectForKey:k];
+            out[k] = [v isKindOfClass:[NSString class]]
+                   ? MKRewriteWatermarkText(v, -1, "vb")
+                   : MKRewriteJSONTree(v, hits);
+            if (![out[k] isEqual:v]) (*hits)++;
+        }
+        return out;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray arrayWithCapacity:[(NSArray *)obj count]];
+        for (id v in (NSArray *)obj) {
+            id nv = [v isKindOfClass:[NSString class]]
+                  ? MKRewriteWatermarkText(v, -1, "vb")
+                  : MKRewriteJSONTree(v, hits);
+            [out addObject:nv];
+            if (![nv isEqual:v]) (*hits)++;
+        }
+        return out;
+    }
+    return obj;
+}
+
+// 返回改写后的 body；无法改写时返回 nil（调用方保留原 body）
+static NSData *MKRewriteVerifyRecordBody(NSData *body) {
+    if (!body.length) return nil;
+    const uint8_t *b = body.bytes;
+
+    MKLog(@"[VB] syncPersonMom body %lu B hex=%@", (unsigned long)body.length, MKHexDump(body, 160));
+
+    if (b[0] != '{' && b[0] != '[') {
+        MKLog(@"[VB] body is not JSON (first=0x%02x) -> pass through unmodified", b[0]);
+        return nil;
+    }
+
+    id json = [NSJSONSerialization JSONObjectWithData:body options:0 error:NULL];
+    if (!json) { MKLog(@"[VB] body looks JSON but parse failed -> pass through"); return nil; }
+
+    NSString *before = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    if (before.length > 1200) before = [[before substringToIndex:1200] stringByAppendingString:@"...(cut)"];
+    MKLog(@"[VB] before: %@", before);
+
+    int hits = 0;
+    id out = MKRewriteJSONTree(json, &hits);
+    if (!hits) { MKLog(@"[VB] no field matched -> pass through"); return nil; }
+
+    NSData *nd = [NSJSONSerialization dataWithJSONObject:out options:0 error:NULL];
+    if (!nd) { MKLog(@"[VB] re-serialize failed -> pass through"); return nil; }
+
+    NSString *after = [[NSString alloc] initWithData:nd encoding:NSUTF8StringEncoding];
+    if (after.length > 1200) after = [[after substringToIndex:1200] stringByAppendingString:@"...(cut)"];
+    MKLog(@"[VB] rewrote %d fields, %lu -> %lu B", hits,
+          (unsigned long)body.length, (unsigned long)nd.length);
+    MKLog(@"[VB] after : %@", after);
+    return nd;
+}
+
 static void MKDumpWatermark(NSString *url, NSString *method, NSDictionary *headers,
                             NSData *reqBody, NSData *respBody, NSInteger status) {
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -3149,9 +3274,26 @@ static void MKInstallSessionSniffer(void) {
     }
 
     BOOL isGeo = MKIsGeoURL(req.URL);
+    BOOL isVerify = MKIsVerifyRecordURL(req.URL);
 
     NSMutableURLRequest *fwd = [req mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:@"MKHandled" inRequest:fwd];   // 防自循环
+
+    // 验真登记：在转发前把 body 换掉（改的是 body，不是 URL，sign 不受影响）
+    if (isVerify && CFG().rewriteVerifyBody) {
+        @try {
+            NSData *origBody = MKReadRequestBody(fwd);
+            NSData *newBody  = MKRewriteVerifyRecordBody(origBody);
+            if (newBody) {
+                fwd.HTTPBody = newBody;
+                [fwd setValue:[NSString stringWithFormat:@"%lu", (unsigned long)newBody.length]
+                   forHTTPHeaderField:@"Content-Length"];
+                MKLog(@"[VB] body replaced before forward");
+            }
+        } @catch (NSException *e) {
+            MKLog(@"[VB] rewrite exception: %@", e.reason);
+        }
+    }
 
     __weak typeof(self) weakSelf = self;
     NSURLSessionDataTask *t = [MKForwardSession() dataTaskWithRequest:fwd
@@ -3659,7 +3801,7 @@ static void MKInstallDeferredHooks(void) {
     MKSafeInstall(MKInstallTimeHooks, "TIME_OBJC");
     // 请求监控必须无条件装（广告拦截在函数内部自己判断开关）
     MKSafeInstall(MKInstallAdBlock, "NET_ADBLOCK");
-    if (CFG().safeClockOn) { @try { MKSetSafeClock(YES); } @catch (NSException *e) {} }
+    // C 层时钟已永久停用，这里不再安装任何 time()/CFAbsoluteTime 钩子
 }
 
 static void MKSchedulePanel(void) {
