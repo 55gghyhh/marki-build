@@ -1161,6 +1161,7 @@ static id MKRewriteWatermarkText(id content, int itemId, const char *src) {
     if (!s.length) return content;
 
     MKFakeCfg *c = CFG();
+    if (!c.timeOn && !c.locOn && !c.wxOn) return content;   // 三个开关全关，零开销直通
     NSString *out = s;
     NSString *why = nil;
 
@@ -1185,7 +1186,18 @@ static id MKRewriteWatermarkText(id content, int itemId, const char *src) {
     }
 
     if (why) {
-        MKLog(@"[Render-%s] item#%d  \"%@\"  ->  \"%@\"", src, itemId, s, out);
+        // 这个函数会被 renderMark 每帧调用，同样的替换只打一次，避免日志刷爆
+        static NSMutableSet *seen = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+        NSString *key = [NSString stringWithFormat:@"%s|%d|%@|%@", src, itemId, s, out];
+        @synchronized (seen) {
+            if (![seen containsObject:key]) {
+                [seen addObject:key];
+                if (seen.count > 256) [seen removeAllObjects];
+                MKLog(@"[Render-%s] item#%d  \"%@\"  ->  \"%@\"", src, itemId, s, out);
+            }
+        }
     } else if (s.length && s.length < 40) {
         MKLOG_ONCE(@"· 未命中替换的 item 示例：item#%d \"%@\"（看日志后可加白名单）", itemId, s);
     }
@@ -1207,10 +1219,156 @@ static id h_gmGetContent2(id self, SEL _cmd, int itemId) {
     id r = ((id (*)(id, SEL, int))o_gmGetContent2)(self, _cmd, itemId);
     return MKRewriteWatermarkText(r, itemId, "core");
 }
-// ④ GMCVPixelBuffer async pull：惰性 block 签名不明，只旁听，裹一层会崩
+// ④ GMCVPixelBuffer async pull
+//
+//  block 的形参个数不明，硬裹 (id) 会崩。这里先读 Block_layout 的
+//  descriptor->signature（这是 libclosure 里稳定十年的 ABI），数一下参数个数：
+//    "v24@?0@\"NSString\"8"   → '@' 出现 2 次 = @? + 1 个对象参数 → 可以安全裹成 void(^)(id)
+//    其它情况一律透传，只打一次签名日志。
+typedef struct { void *isa; volatile int32_t flags; int32_t reserved; void *invoke; void *descriptor; } MKBlockLayout;
+typedef struct { unsigned long reserved; unsigned long size; void *copy; void *dispose; const char *signature; } MKBlockDesc;
+
+static const char *MKBlockSignature(id blk) {
+    if (!blk) return NULL;
+    MKBlockLayout *l = (MKBlockLayout *)blk;
+    if (!l->descriptor) return NULL;
+    MKBlockDesc *d = (MKBlockDesc *)l->descriptor;
+    return d->signature;
+}
+
+// 只数 '@'：block 自身占一个 @?，每多一个对象参数就多一个 '@'
+static int MKBlockObjArgCount(const char *sig) {
+    if (!sig) return -1;
+    int n = 0;
+    for (const char *p = sig; *p; p++) if (*p == '@') n++;
+    return n - 1;
+}
+
 static void h_gmGetContentAsync(id self, SEL _cmd, int itemId, id completion) {
-    ((void (*)(id, SEL, int, id))o_gmGetContentAsync)(self, _cmd, itemId, completion);
-    MKLOG_ONCE(@"[AsyncPull] item#%d block=%p（如需接管请看这条日志）", itemId, completion);
+    const char *sig = MKBlockSignature(completion);
+    int argc = MKBlockObjArgCount(sig);
+
+    MKLOG_ONCE(@"[AsyncPull] item#%d sig=%s argc=%d", itemId, sig ? sig : "(null)", argc);
+
+    if (o_gmGetContentAsync && argc == 1 && completion) {
+        __block void (^orig)(id) = (void (^)(id))completion;
+        void (^wrap)(id) = ^(id content) {
+            id nc = MKRewriteWatermarkText(content, itemId, "async");
+            if (orig) orig(nc);
+        };
+        ((void (*)(id, SEL, int, id))o_gmGetContentAsync)(self, _cmd, itemId, [wrap copy]);
+        return;
+    }
+    if (o_gmGetContentAsync) {
+        ((void (*)(id, SEL, int, id))o_gmGetContentAsync)(self, _cmd, itemId, completion);
+    }
+}
+
+// ============================================================================
+//  最终提交点（拍照瞬间真正用于绘图的文本快照）
+//
+//  push / pull 两条路都改对了，但照片仍然是真时间 —— 说明绘图用的不是这两条：
+//    ⑥ -renderMarkWithInputTexture:andSize:andData:  (v44@0:8i16{CGSize=dd}20@36)
+//       andData 是拍照那一刻一次性传进去的 itemId→content 字典，绕过 push/pull。
+//    ⑦ -filterCacheDataWithData:                     (@24@0:8@16)
+//       纹理/数据缓存里存的是旧的真值，下次渲染直接从缓存取，也绕过 push/pull。
+//  这两处必须一起接管，否则预览是假时间、成片是真时间。
+// ============================================================================
+
+static IMP o_renderMarkData = NULL, o_filterCache = NULL;
+
+// ---------------------------------------------------------------------------
+//  渲染闸门：renderMark* 是 60fps 高频路径，绝不能每帧都递归 + 正则 + copy。
+//  思路：只在「按下快门」之后的 2 秒窗口内做替换，预览帧一律原样透传。
+//  窗口由 capturePhoto* 三个入口点亮；如果三个入口都没命中（老版本/换实现），
+//  则退回「始终允许」，保证功能不会因为钩子缺失而静默失效。
+// ---------------------------------------------------------------------------
+static volatile CFAbsoluteTime gRenderArmedUntil = 0;
+static volatile BOOL gRenderGateEverArmed = NO;
+
+static void MKRenderArm(const char *why) {
+    gRenderArmedUntil = CFAbsoluteTimeGetCurrent() + 2.0;
+    if (!gRenderGateEverArmed) {
+        gRenderGateEverArmed = YES;
+        MKLog(@"[RenderGate] armed first time by %s", why);
+    }
+}
+
+static BOOL MKRenderArmed(void) {
+    if (!gRenderGateEverArmed) return YES;                 // 钩子没命中，别把功能关死
+    return (CFAbsoluteTimeGetCurrent() < gRenderArmedUntil);
+}
+
+// 快门入口 ① GLPreviewView
+static IMP o_previewCapture = NULL;
+static void h_previewCapture(id self, SEL _cmd, id factor, id outer, id complete) {
+    MKRenderArm("GLPreviewView.capturePhoto");
+    if (o_previewCapture) ((void (*)(id, SEL, id, id, id))o_previewCapture)(self, _cmd, factor, outer, complete);
+}
+// 快门入口 ② GLVideoDevice
+static IMP o_deviceCapture = NULL;
+static void h_deviceCapture(id self, SEL _cmd, id complete) {
+    MKRenderArm("GLVideoDevice.capturePhoto");
+    if (o_deviceCapture) ((void (*)(id, SEL, id))o_deviceCapture)(self, _cmd, complete);
+}
+// 快门入口 ③ GLSingleCapture
+static IMP o_singleCapture = NULL;
+static id h_singleCapture(id self, SEL _cmd) {
+    MKRenderArm("GLSingleCapture.capturePhoto");
+    return o_singleCapture ? ((id (*)(id, SEL))o_singleCapture)(self, _cmd) : nil;
+}
+
+// 递归替换任意容器里的字符串（只换命中日期/地址/天气的，其余原样返回）
+static id MKRewriteDeepText(id obj) {
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = nil;
+        for (id k in [(NSDictionary *)obj allKeys]) {
+            id v = [(NSDictionary *)obj objectForKey:k];
+            id nv = [v isKindOfClass:[NSString class]]
+                  ? MKRewriteWatermarkText(v, -1, "data")
+                  : MKRewriteDeepText(v);
+            if (nv != v) {
+                if (!out) out = [obj mutableCopy];
+                out[k] = nv;
+            }
+        }
+        return out ?: obj;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = nil;
+        NSArray *arr = (NSArray *)obj;
+        for (NSUInteger i = 0; i < arr.count; i++) {
+            id v = arr[i];
+            id nv = [v isKindOfClass:[NSString class]]
+                  ? MKRewriteWatermarkText(v, -1, "data")
+                  : MKRewriteDeepText(v);
+            if (nv != v) {
+                if (!out) out = [arr mutableCopy];
+                out[i] = nv;
+            }
+        }
+        return out ?: obj;
+    }
+    return obj;
+}
+
+// 观测：不带 data 的重载，成片如果走这条，说明文本来自 filter 内部存储（靠 ⑦ 缓存 hook 兜）
+static IMP o_renderMarkPlain = NULL;
+static void h_renderMarkPlain(id self, SEL _cmd, int tex, CGSize size) {
+    MKLOG_ONCE(@"[Render-plain] renderMarkWithInputTexture:andSize: 被调用（成片可能走这条）");
+    if (o_renderMarkPlain) ((void (*)(id, SEL, int, CGSize))o_renderMarkPlain)(self, _cmd, tex, size);
+}
+
+// ⑥ 最终提交（带闸门）
+static void h_renderMarkData(id self, SEL _cmd, int tex, CGSize size, id data) {
+    id nd = MKRenderArmed() ? MKRewriteDeepText(data) : data;
+    ((void (*)(id, SEL, int, CGSize, id))o_renderMarkData)(self, _cmd, tex, size, nd);
+}
+
+// ⑦ 缓存（只在窗口内改写，避免把预览期的真值也永久污染成假值）
+static id h_filterCache(id self, SEL _cmd, id data) {
+    id nd = MKRenderArmed() ? MKRewriteDeepText(data) : data;
+    return ((id (*)(id, SEL, id))o_filterCache)(self, _cmd, nd);
 }
 
 static void MKInstallWeatherHooks(void) {
@@ -1223,6 +1381,26 @@ static void MKInstallWeatherHooks(void) {
     o_gmGetContentAsync = MKHook(objc_getClass("GMCVPixelBuffer"),
                                  MKSEL(getWatermarkItemContentWithId:withCompletion:),
                                  (IMP)h_gmGetContentAsync, "Render_PullAsync");
+
+    // ⑥⑦ 拍照瞬间 / 缓存这两条绕过 push-pull 的路径
+    o_renderMarkData = MKHook(objc_getClass("GPUMarkImageFilter"),
+                              MKSEL(renderMarkWithInputTexture:andSize:andData:),
+                              (IMP)h_renderMarkData, "Render_FinalData");
+    o_filterCache = MKHook(objc_getClass("GPUMarkImageFilter"),
+                           MKSEL(filterCacheDataWithData:),
+                           (IMP)h_filterCache, "Render_Cache");
+    o_renderMarkPlain = MKHook(objc_getClass("GPUMarkImageFilter"),
+                               MKSEL(renderMarkWithInputTexture:andSize:),
+                               (IMP)h_renderMarkPlain, "Render_PlainObserve");
+
+    // 快门入口（用来点亮渲染闸门）
+    o_previewCapture = MKHook(objc_getClass("GLPreviewView"),
+                              MKSEL(capturePhotoWithFactor:outerEffect:complete:),
+                              (IMP)h_previewCapture, "Gate_PreviewCapture");
+    o_deviceCapture = MKHook(objc_getClass("GLVideoDevice"),
+                             MKSEL(capturePhoto:), (IMP)h_deviceCapture, "Gate_DeviceCapture");
+    o_singleCapture = MKHook(objc_getClass("GLSingleCapture"),
+                             MKSEL(capturePhoto), (IMP)h_singleCapture, "Gate_SingleCapture");
 
     // 天气模型（保持原有）
     Class w = objc_getClass("MKWeatherInfo");
@@ -1467,6 +1645,40 @@ static CFDictionaryRef mk_CGImageSourceCopyPropertiesAtIndex(CGImageSourceRef sr
     NSMutableDictionary *exif = [mut[(id)kCGImagePropertyExifDictionary] mutableCopy] ?: [NSMutableDictionary dictionary];
     exif[(id)kCGImagePropertyExifUserComment] = txt;
     mut[(id)kCGImagePropertyExifDictionary] = exif;
+
+    // GPS 也钉死：截图里显示的 30.583/104.079 是 App 用我们伪造的 CLLocation 自己写的，
+    // 但只要有任意一条路径读到真坐标就会漏，这里显式覆盖一层保险。
+    //
+    // 格式说明（纠正一个常见误解）：
+    //   kCGImagePropertyGPSLatitude 写给 CGImageDestination 时，Apple 规定是
+    //   「NSNumber，带符号的十进制度数」。EXIF 二进制里的度分秒有理数是 ImageIO
+    //   序列化时自己拆的；直接塞 @[deg,min,sec] 反而会被 ImageIO 忽略甚至写坏。
+    //   所以默认写 NSNumber。想强制成数组可把下面的宏改成 1（不推荐）。
+#define MK_GPS_DMS 0
+    if (CFG().locOn) {
+        NSMutableDictionary *gps = [mut[(id)kCGImagePropertyGPSDictionary] mutableCopy] ?: [NSMutableDictionary dictionary];
+        gps[(id)kCGImagePropertyGPSVersion] = @[@2, @(2), @(0), @(0)];
+
+#if MK_GPS_DMS
+        double alat = fabs(CFG().lat), alng = fabs(CFG().lng);
+        int d1 = (int)alat, m1 = (int)((alat - d1) * 60);
+        double s1 = (alat - d1 - m1 / 60.0) * 3600.0;
+        int d2 = (int)alng, m2 = (int)((alng - d2) * 60);
+        double s2 = (alng - d2 - m2 / 60.0) * 3600.0;
+        gps[(id)kCGImagePropertyGPSLatitude]  = @[@(d1), @(m1), @(s1)];
+        gps[(id)kCGImagePropertyGPSLongitude] = @[@(d2), @(m2), @(s2)];
+        MKLOG_ONCE(@"★ EXIF GPS(DMS) %d°%d'%.2f\" %d°%d'%.2f\"", d1, m1, s1, d2, m2, s2);
+#else
+        gps[(id)kCGImagePropertyGPSLatitude]  = @(fabs(CFG().lat));
+        gps[(id)kCGImagePropertyGPSLongitude] = @(fabs(CFG().lng));
+        MKLOG_ONCE(@"★ EXIF GPS(十进制) %@,%@", gps[(id)kCGImagePropertyGPSLatitude],
+                   gps[(id)kCGImagePropertyGPSLongitude]);
+#endif
+
+        gps[(id)kCGImagePropertyGPSLatitudeRef]  = (CFG().lat >= 0) ? @"N" : @"S";
+        gps[(id)kCGImagePropertyGPSLongitudeRef] = (CFG().lng >= 0) ? @"E" : @"W";
+        mut[(id)kCGImagePropertyGPSDictionary]   = gps;
+    }
 
     MKLOG_ONCE(@"★ EXIF 注入生效：ImageDescription/Caption = %@", txt);
     return (CFDictionaryRef)CFRetain((__bridge CFTypeRef)mut);
@@ -2722,6 +2934,9 @@ static void MKLogNetReq(NSString *urlStr) {
 // ============================================================================
 
 static BOOL MKIsGeoURL(NSURL *url) {
+    // 渲染层模式：地理请求连拦都不拦，保证 getPlaceSuggestion 拿到的是服务端原话，
+    // 这样后续 getNewWatermark 的 placeId 与坐标天然自洽，不会再有 resp=0。
+    if (CFG().renderOnly) return NO;
     if (!url) return NO;
     NSString *s = url.absoluteString;
     if (!s.length) return NO;
