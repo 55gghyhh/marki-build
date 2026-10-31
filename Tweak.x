@@ -1171,11 +1171,62 @@ static NSString *MKReplaceDateTime(NSString *s) {
 //  上一版整串覆盖成纯地址，引擎解析失败 → 水印退化成默认文案（截图里的
 //  “在这里”就是这么来的）。所以先识别 JSON，只改里面的 address 值，再序列化回去。
 // ---------------------------------------------------------------------------
+// 假时间的 epoch（秒），只在本文件内缓存
+static long long MKFakeEpoch(void) {
+    static long long cached = 0;
+    if (cached) return cached;
+    NSDate *d = MKParseFakeTime(CFG().fakeTime);
+    if (d) cached = (long long)llround([d timeIntervalSince1970]);
+    if (!cached) cached = (long long)time(NULL);
+    return cached;
+}
+
+// 这些 key 存的是「拍摄时间」的 epoch 数字（秒或毫秒）
+static BOOL MKIsEpochKey(NSString *k) {
+    static NSSet *set = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        set = [NSSet setWithArray:@[@"time", @"timestamp", @"ts", @"shootTime",
+                                    @"shootTimestamp", @"captureTime", @"ctime",
+                                    @"createTime", @"createAt", @"mt"]];
+    });
+    return [set containsObject:k];
+}
+
+// 把所有「像 epoch 的数值」换成假时间，秒/毫秒自动判断
+static BOOL MKReplaceEpochInDict(NSMutableDictionary *d) {
+    BOOL hit = NO;
+    long long fake = MKFakeEpoch();
+    for (NSString *k in [d allKeys]) {
+        id v = d[k];
+        if ([MKIsEpochKey(k)] && [v isKindOfClass:[NSNumber class]]) {
+            long long n = [(NSNumber *)v longLongValue];
+            if (n > 1000000000LL && n < 10000000000LL) {          // 秒
+                d[k] = @(fake); hit = YES;
+            } else if (n > 1000000000000LL && n < 10000000000000LL) {   // 毫秒
+                d[k] = @(fake * 1000LL); hit = YES;
+            }
+        } else if ([v isKindOfClass:[NSDictionary class]]) {
+            NSMutableDictionary *sub = [v mutableCopy];
+            if (MKReplaceEpochInDict(sub)) { d[k] = sub; hit = YES; }
+        } else if ([v isKindOfClass:[NSArray class]]) {
+            NSMutableArray *arr = [v mutableCopy];
+            for (NSUInteger i = 0; i < arr.count; i++) {
+                if ([arr[i] isKindOfClass:[NSDictionary class]]) {
+                    NSMutableDictionary *sub = [arr[i] mutableCopy];
+                    if (MKReplaceEpochInDict(sub)) { arr[i] = sub; hit = YES; }
+                }
+            }
+            if (hit) d[k] = arr;
+        }
+    }
+    return hit;
+}
+
 static NSString *MKRewriteJSONString(NSString *s, int *did) {
     if (did) *did = 0;
-    if (s.length < 8 || s.length > 512) return s;
+    if (s.length < 6 || s.length > 4096) return s;
     if (![s hasPrefix:@"{"]) return s;
-    if (![s containsString:@"address"] && ![s containsString:@"tips"]) return s;
 
     NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
     if (!d) return s;
@@ -1184,6 +1235,8 @@ static NSString *MKRewriteJSONString(NSString *s, int *did) {
 
     NSMutableDictionary *mut = [json mutableCopy];
     int hits = 0;
+
+    // ① 地址 / 名称类字段
     for (NSString *k in [json allKeys]) {
         id v = json[k];
         if (![v isKindOfClass:[NSString class]]) continue;
@@ -1195,6 +1248,15 @@ static NSString *MKRewriteJSONString(NSString *s, int *did) {
             hits++;
         }
     }
+
+    // ② epoch 数值字段（形如 {"accuracy":2,"time":1793419934588}）
+    //    这类 item 是水印元数据，里面的 time 是真实毫秒，必须一起换掉，
+    //    否则它会带着真实时间进入 verificationInfo / 上传链路。
+    if (MKTimeSpoofOn() && MKReplaceEpochInDict(mut)) {
+        MKLOG_ONCE(@"[Render-json] epoch 字段已替换为假时间 %lld", MKFakeEpoch());
+        hits++;
+    }
+
     if (!hits) return s;
 
     NSData *out = [NSJSONSerialization dataWithJSONObject:mut options:0 error:NULL];
@@ -1202,7 +1264,22 @@ static NSString *MKRewriteJSONString(NSString *s, int *did) {
     if (!ret) return s;
 
     if (did) *did = 1;
-    MKLog(@"[Render-json] %@  ->  %@", s, ret);
+    {
+        // 按 key 做 30 秒节流：既不会刷屏，也不会漏掉「换了配置后」的新变化
+        static NSMutableDictionary<NSString *, NSNumber *> *jseen = nil;
+        static dispatch_once_t jonce;
+        dispatch_once(&jonce, ^{ jseen = [NSMutableDictionary dictionary]; });
+        NSString *k = [NSString stringWithFormat:@"%@|%@", s, ret];
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        @synchronized (jseen) {
+            NSNumber *last = jseen[k];
+            if (!last || now - last.doubleValue > 30.0) {
+                jseen[k] = @(now);
+                if (jseen.count > 64) [jseen removeAllObjects];
+                MKLog(@"[Render-json] %@  ->  %@", s, ret);
+            }
+        }
+    }
     return ret;
 }
 
@@ -1353,8 +1430,15 @@ static void MKRenderArm(const char *why) {
 }
 
 static BOOL MKRenderArmed(void) {
-    if (!gRenderGateEverArmed) return YES;                 // 钩子没命中，别把功能关死
-    return (CFAbsoluteTimeGetCurrent() < gRenderArmedUntil);
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!gRenderGateEverArmed) {
+        // 快门钩子没命中时的退化策略：限速 0.5s 一次，绝不每帧解析 JSON
+        static CFAbsoluteTime lastTick = 0;
+        if (now - lastTick < 0.5) return NO;
+        lastTick = now;
+        return YES;
+    }
+    return (now < gRenderArmedUntil);
 }
 
 // 快门入口 ① GLPreviewView
@@ -3078,18 +3162,20 @@ static NSData *MKLoadWMTemplate(void) {
     return d.length > 32 ? d : nil;
 }
 
-static void MKSaveWMTemplate(NSData *resp) {
-    if (resp.length <= 32) return;
+static BOOL MKSaveWMTemplate(NSData *resp) {
+    if (resp.length <= 32) return NO;
     const uint8_t *b = resp.bytes;
-    if (resp.length > 2 && b[0] == 0x1f && b[1] == 0x8b) return;   // gzip 的先不存，免得回放时解不开
+    if (resp.length > 2 && b[0] == 0x1f && b[1] == 0x8b) return NO;   // gzip 的先不存，免得回放时解不开
     NSUInteger i = 0;
     while (i < resp.length && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n')) i++;
-    if (i >= resp.length || (b[i] != '{' && b[i] != '[')) return;   // 只认明文 JSON
+    if (i >= resp.length || (b[i] != '{' && b[i] != '[')) return NO;   // 只认明文 JSON
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [doc stringByAppendingPathComponent:@"mk_wm_template.json"];
     if ([resp writeToFile:path atomically:YES]) {
         MKLog(@"[WM] template saved %@ (%lu B)", path, (unsigned long)resp.length);
+        return YES;
     }
+    return NO;
 }
 
 // 判断是不是「失败响应」
@@ -3097,6 +3183,31 @@ static void MKSaveWMTemplate(NSData *resp) {
 //   · 明文 JSON（跳过前导空白）→ 成功
 //   · gzip（Content-Encoding 包过一层）→ 当作成功，别覆盖
 //   · 其它二进制（protobuf 错误包 field1=-101 "unauthorized user!"）→ 失败
+// marki 的错误包固定形态：field1 = 负数 varint（-101 unauthorized / -109 参数错误），
+// 紧跟 field2 = 错误文案。整包会重复两遍，只看第一段。
+static BOOL MKIsWMErrorPacket(NSData *d) {
+    const uint8_t *b = d.bytes;
+    NSUInteger n = d.length;
+    if (n < 4 || b[0] != 0x08) return NO;                 // 必须以 field1 varint 开头
+    NSUInteger i = 1;
+    unsigned long long v = 0; int sh = 0;
+    while (i < n) {
+        uint8_t x = b[i++];
+        v |= (unsigned long long)(x & 0x7f) << sh;
+        if (!(x & 0x80)) break;
+        sh += 7;
+        if (sh > 63) return NO;
+    }
+    if (!(v & (1ULL << 63))) return NO;                  // 不是负数 → 不是错误码
+    return (i < n && b[i] == 0x12);                      // 后面必须跟 field2 string
+}
+
+// 判断是不是「失败响应」
+//   · 空 → 失败
+//   · gzip → 当作成功
+//   · 明文 JSON → 成功
+//   · 明确的负数错误包 → 失败
+//   · 其它 protobuf → 成功（原本一律判失败，把 566 B 的等级数据也误报了）
 static BOOL MKIsWMFailure(NSData *resp) {
     if (!resp.length) return YES;
     const uint8_t *b = resp.bytes;
@@ -3104,7 +3215,8 @@ static BOOL MKIsWMFailure(NSData *resp) {
     NSUInteger i = 0;
     while (i < resp.length && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n')) i++;
     if (i < resp.length && (b[i] == '{' || b[i] == '[')) return NO;   // JSON = 成功
-    return YES;
+    if (MKIsWMErrorPacket(resp)) return YES;                          // 确认是错误包
+    return NO;                                                        // 其余当成功
 }
 
 // 模板打补丁：只换展示字段，placeId / location 一个字节都不动
@@ -3185,7 +3297,9 @@ static void h_didComplete(id self, SEL _cmd, id session, id task, NSError *error
 
             if (!MKIsWMFailure(respBody)) {
                 // 真成功：存成模板，供以后失败时回放
-                MKSaveWMTemplate(respBody);
+                if (!MKSaveWMTemplate(respBody)) {
+                    MKLog(@"[WM] resp ok, 非模板内容 (%lu B)，不存不留", (unsigned long)respBody.length);
+                }
             } else if (CFG().replayWM) {
                 NSData *fake = MKPatchWMTemplate(MKLoadWMTemplate());
                 if (fake.length) {
