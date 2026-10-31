@@ -1230,7 +1230,7 @@ typedef struct { unsigned long reserved; unsigned long size; void *copy; void *d
 
 static const char *MKBlockSignature(id blk) {
     if (!blk) return NULL;
-    MKBlockLayout *l = (MKBlockLayout *)blk;
+    MKBlockLayout *l = (__bridge MKBlockLayout *)blk;
     if (!l->descriptor) return NULL;
     MKBlockDesc *d = (MKBlockDesc *)l->descriptor;
     return d->signature;
